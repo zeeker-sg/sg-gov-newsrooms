@@ -143,8 +143,8 @@ content_text = "Full extracted article text (hidden — query directly)"
 created_at = "Timestamp when this record was first imported"
 
 [resource.pdpc_news]
-description = "Media releases, speeches, and advisories from the Personal Data Protection Commission Singapore (PDPC). From 2026 onwards."
-source_url = "https://www.pdpc.gov.sg/news-and-events/press-room"
+description = "Media releases, speeches, advisories, announcements, events and reports from the Personal Data Protection Commission Singapore (PDPC). From 2026 onwards."
+source_url = "https://www.pdpc.gov.sg/media-events"
 sort_desc = "published_date"
 label_column = "title"
 facets = ["category"]
@@ -155,7 +155,7 @@ fts_fields = ["title", "summary"]
 id = "Unique identifier (SHA-256 hash of source URL)"
 title = "Title of the press release, speech, or advisory"
 published_date = "Publication date in ISO 8601 format (YYYY-MM-DD)"
-category = "Content type: media-release, speech, forum-reply, article-clarification, advertorial"
+category = "Content type slug: press-room, announcements, advisories, events, reports (post-Apr-2026 site categories)"
 source_url = "URL to the original page on pdpc.gov.sg"
 summary = "AI-generated summary highlighting key data protection and PDPA developments (~100 words)"
 content_text = "Full extracted article text (hidden — query directly)"
