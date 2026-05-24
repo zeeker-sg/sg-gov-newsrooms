@@ -24,6 +24,12 @@ from pathlib import Path
 
 from openai import AsyncOpenAI
 
+# Allow importing the shared token helper from ../resources/
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_RESOURCES_DIR = _SCRIPT_DIR.parent / "resources"
+sys.path.insert(0, str(_RESOURCES_DIR))
+from _token_usage import _log_token_usage
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -198,6 +204,17 @@ async def summarise(
                 {"role": "user", "content": user_msg},
             ],
         )
+        try:
+            _log_token_usage(
+                agent="sg-gov-newsrooms-zeeker",
+                endpoint=LLM_BASE_URL,
+                model=LLM_MODEL,
+                prompt_tokens=getattr(response.usage, "prompt_tokens", None),
+                completion_tokens=getattr(response.usage, "completion_tokens", None),
+                call_type="backfill_summary",
+            )
+        except Exception:
+            pass
         return (response.choices[0].message.content or "").strip()
 
 
