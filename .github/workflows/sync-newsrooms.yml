@@ -5,8 +5,8 @@
 name: Sync Government Newsrooms
 
 on:
-  schedule:
-    - cron: "0 3 * * *"  # 03:00 UTC = 11:00 AM SGT
+  # schedule:
+  #  - cron: "0 3 * * *"  # 03:00 UTC = 11:00 AM SGT
   workflow_dispatch:
 
 jobs:
