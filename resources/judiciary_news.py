@@ -34,6 +34,14 @@ from openai import AsyncOpenAI
 from sqlite_utils.db import Table
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+try:
+    from ._token_usage import _log_token_usage
+except ImportError:
+    from pathlib import Path as _P
+    import sys as _sys
+    _sys.path.insert(0, str(_P(__file__).resolve().parent))
+    from _token_usage import _log_token_usage
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
@@ -53,7 +61,17 @@ MAX_CONSECUTIVE_FAILURES = 5
 MAX_RETRIES = 3
 
 # LLM concurrency
-_LLM_SEMAPHORE = asyncio.Semaphore(3)
+_LLM_SEMAPHORES = {}
+
+def _get_llm_semaphore() -> asyncio.Semaphore:
+    try:
+        loop = asyncio.get_running_loop()
+        loop_id = id(loop)
+    except RuntimeError:
+        loop_id = 0
+    if loop_id not in _LLM_SEMAPHORES:
+        _LLM_SEMAPHORES[loop_id] = asyncio.Semaphore(3)
+    return _LLM_SEMAPHORES[loop_id]
 
 # CADENCE: Daily (Tier 1)
 # judiciary.gov.sg publishes ~3–10 news items per week
@@ -305,7 +323,7 @@ async def get_summary(text: str, title: str) -> str:
 
     content_snippet = text[:4000] if text else title
 
-    async with _LLM_SEMAPHORE:
+    async with _get_llm_semaphore():
         try:
             response = await client.chat.completions.create(
                 model=model,
@@ -314,6 +332,17 @@ async def get_summary(text: str, title: str) -> str:
                     {"role": "user", "content": f"Summarise this Singapore judiciary news item:\n\n{content_snippet}"},
                 ],
             )
+            try:
+                _log_token_usage(
+                    agent="sg-gov-newsrooms-zeeker",
+                    endpoint=base_url,
+                    model=model,
+                    prompt_tokens=getattr(response.usage, "prompt_tokens", None),
+                    completion_tokens=getattr(response.usage, "completion_tokens", None),
+                    call_type="judiciary_summary",
+                )
+            except Exception:
+                pass
             summary = response.choices[0].message.content or ""
             return summary.strip()
         except Exception as e:

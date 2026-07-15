@@ -145,3 +145,52 @@ All resources in this collection follow these principles:
 6. **No personal data** — scrape institutional communications only, not individual profiles
 7. **Copyright awareness** — note licensing on each resource; hide full content when unclear
 8. **Per-domain rate limits** — each agency's site gets its own polite_sleep budget
+
+---
+
+## Build Monitoring Guide (for AI agents)
+
+This section helps AI agents monitoring the build pipeline interpret log output correctly.
+
+### Resources and what "no data returned" means
+
+This repo has 8 resources, all scraping Singapore government websites. Most do NOT require a proxy. **`pdpc_news` is the exception — it requires the Tailscale SOCKS5 proxy** because PDPC uses CloudFront which blocks datacenter IPs.
+
+| Resource | Source | Proxy? | Normal "no data" cause | Abnormal "no data" cause |
+|----------|--------|--------|----------------------|------------------------|
+| `mlaw_news` | mlaw.gov.sg sitemap | No | All 2026+ articles already imported (~2–5 new/week) | Sitemap unreachable, circuit breaker tripped |
+| `judiciary_news` | judiciary.gov.sg AJAX API | No | All 2026+ articles already imported (~3–10/week) | API endpoint changed, connection timeout |
+| `agc_news` | agc.gov.sg sitemap | No | All 2026+ articles already imported | Sitemap unreachable |
+| `ipos_news` | ipos.gov.sg paginated listing | No | All 2026+ articles already imported (~1–3/week) | Listing page structure changed |
+| `ccs_news` | ccs.gov.sg paginated listing | No | All 2026+ articles already imported (~1–3/week) | Listing page structure changed |
+| `acra_news` | acra.gov.sg sitemap | No | All 2026+ announcements already imported | Sitemap unreachable |
+| `mom_news` | mom.gov.sg sitemap | No | All 2026+ press releases already imported | Sitemap unreachable |
+| `pdpc_news` | pdpc.gov.sg sitemap | **Yes** | All 2026+ articles already imported | **ProxyError** — `Failed to fetch sitemap: RetryError[ProxyError]`. Duration 20–200s. |
+
+### The pdpc_news trap
+
+`pdpc_news` is the most common source of disguised failures in this repo. It shows as `[SKIP] pdpc_news no data returned (109.4s)` — the 109-second duration (vs 0.2s for other resources) is the telltale sign of proxy retries timing out. The Tailscale exit node (ASUS router) must be online for this resource to work.
+
+### Normal yield expectations
+
+- **All resources combined:** 0–5 new articles per day (government news is slow)
+- **Most common pattern:** All 8 resources return "no data returned" — this is normal on most days
+- **Build duration:** 5–30s when all up to date, 100–150s when pdpc_news is timing out
+
+### How to tell a healthy skip from a failure
+
+- **Healthy skip:** Duration 0.1–2s, no error messages in surrounding log lines
+- **Failed skip (pdpc_news proxy):** Duration 20–200s, log shows `Failed to fetch sitemap: RetryError[<Future ... raised ProxyError>]`
+- **Failed skip (other resource):** Duration >5s, log shows `circuit breaker`, `RetryError`, or `ConnectError`
+
+### Current DB stats (as of Jul 2026)
+
+- mlaw_news: ~50 rows
+- judiciary_news: ~34 rows
+- agc_news: ~295 rows
+- ipos_news: ~12 rows
+- ccs_news: ~16 rows
+- acra_news: ~367 rows
+- mom_news: ~64 rows
+- pdpc_news: ~16 rows
+- **Total: ~854 rows**

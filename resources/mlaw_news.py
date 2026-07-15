@@ -17,6 +17,7 @@ via direct SQL or FTS query. See zeeker.toml for column config.
 
 import asyncio
 import hashlib
+import json
 import os
 import random
 import re
@@ -24,6 +25,14 @@ import time
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 from xml.etree import ElementTree
+
+try:
+    from ._token_usage import _log_token_usage
+except ImportError:
+    from pathlib import Path as _P
+    import sys as _sys
+    _sys.path.insert(0, str(_P(__file__).resolve().parent))
+    from _token_usage import _log_token_usage
 
 import click
 import httpx
@@ -53,7 +62,17 @@ MAX_CONSECUTIVE_FAILURES = 5
 MAX_RETRIES = 3
 
 # LLM concurrency — local Ollama handles one inference at a time
-_LLM_SEMAPHORE = asyncio.Semaphore(3)
+_LLM_SEMAPHORES = {}
+
+def _get_llm_semaphore() -> asyncio.Semaphore:
+    try:
+        loop = asyncio.get_running_loop()
+        loop_id = id(loop)
+    except RuntimeError:
+        loop_id = 0
+    if loop_id not in _LLM_SEMAPHORES:
+        _LLM_SEMAPHORES[loop_id] = asyncio.Semaphore(3)
+    return _LLM_SEMAPHORES[loop_id]
 
 # Known news categories (URL path segments under /news/)
 NEWS_CATEGORIES = {
@@ -352,6 +371,42 @@ def fetch_article(url: str, client: httpx.Client) -> Dict[str, Any]:
 # =============================================================================
 
 
+async def _backfill_empty_summaries(existing_table: Optional[Table]) -> None:
+    """Retroactively generate summaries for rows with empty or null summaries."""
+    if not existing_table:
+        return
+
+    try:
+        rows = list(existing_table.db.execute(
+            f"SELECT id, title, content_text FROM [{existing_table.name}] "
+            "WHERE summary IS NULL OR summary = '' OR summary = 'None'"
+        ))
+    except Exception as e:
+        click.echo(f"Backfill: could not query empty summaries: {e}", err=True)
+        return
+
+    if not rows:
+        return
+
+    click.echo(f"Backfill: found {len(rows)} articles with empty summaries — regenerating")
+
+    async def _fix_one(row_id: str, title: str, content_text: str) -> None:
+        text = content_text or title
+        try:
+            summary = await get_summary(text, title)
+            existing_table.db.execute(
+                f"UPDATE [{existing_table.name}] SET summary = ? WHERE id = ?",
+                [summary, row_id]
+            )
+            click.echo(f"  → Backfilled summary for: {title[:60]}")
+        except Exception as e:
+            click.echo(f"  → Backfill failed for {title[:60]}: {e}", err=True)
+
+    tasks = [asyncio.create_task(_fix_one(r[0], r[1], r[2])) for r in rows]
+    await asyncio.gather(*tasks)
+    click.echo(f"Backfill: done ({len(rows)} articles processed)")
+
+
 async def get_summary(text: str, title: str) -> str:
     """Generate a search-optimized summary using any OpenAI-compatible LLM."""
     base_url = os.environ.get("LLM_BASE_URL", "")
@@ -372,7 +427,7 @@ async def get_summary(text: str, title: str) -> str:
     # Truncate to avoid hitting context limits
     content_snippet = text[:4000] if text else title
 
-    async with _LLM_SEMAPHORE:
+    async with _get_llm_semaphore():
         try:
             response = await client.chat.completions.create(
                 model=model,
@@ -381,6 +436,17 @@ async def get_summary(text: str, title: str) -> str:
                     {"role": "user", "content": f"Summarise this Ministry of Law item:\n\n{content_snippet}"},
                 ],
             )
+            try:
+                _log_token_usage(
+                    agent="sg-gov-newsrooms-zeeker",
+                    endpoint=base_url,
+                    model=model,
+                    prompt_tokens=getattr(response.usage, "prompt_tokens", None),
+                    completion_tokens=getattr(response.usage, "completion_tokens", None),
+                    call_type="mlaw_summary",
+                )
+            except Exception:
+                pass
             summary = response.choices[0].message.content or ""
             return summary.strip()
         except Exception as e:
@@ -416,6 +482,10 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
     Content extraction: BeautifulSoup from <main> element.
     AI summary: Ollama-compatible LLM via LLM_BASE_URL env var.
     """
+    # Backfill empty summaries from previous failed runs
+    if existing_table:
+        asyncio.run(_backfill_empty_summaries(existing_table))
+
     # Build set of already-imported URLs for dedup
     existing_urls: set = set()
     if existing_table:

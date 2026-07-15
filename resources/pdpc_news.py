@@ -2,21 +2,34 @@
 Personal Data Protection Commission Singapore press room resource.
 
 Cadence: Daily (Tier 1)
-Source: https://www.pdpc.gov.sg/news-and-events/press-room
-Strategy: Incremental -- JSON API discovery via CWP platform, filtered to 2026+ articles.
-  The PDPC press room uses a form-encoded POST API with CSRF token authentication.
-  We fetch the token from the page, then paginate the API for the current year.
+Source: https://www.pdpc.gov.sg/media-events  (formerly /news-and-events/press-room)
+Strategy: Sitemap-driven discovery -- fetch /sitemap.xml, take all /media-events/*
+  URLs, filter against existing rows, fetch each detail page, parse title/date/
+  category from the rendered HTML and the article body from the Next.js RSC
+  streaming payload.
 
-Licensing: Government of Singapore, all rights reserved.
-Content stored but NOT shown by default in Datasette UI. See zeeker.toml for column config.
+Site migrated April 2026 from GovTech CWP (ASP.NET, JSON API + CSRF) to GovTech
+Optical (Next.js App Router on S3+CloudFront, SSG). The old API and CSRF flow
+are gone -- there's no live JSON listing endpoint -- and CloudFront returns 403
+to data-centre source IPs, so the build runs through the host's tailscale
+sidecar (TAILSCALE_PROXY) to exit via houfu's Mac.
+
+Detail pages have title/date/category in the rendered HTML, but the article
+body is empty in SSR HTML -- it lives in the streaming RSC payload as a text
+row referenced by `"content":"$<id>"`.
+
+Licensing: Government of Singapore, all rights reserved. Content stored but NOT
+shown by default in Datasette UI; see zeeker.toml for column config.
 """
 
 import asyncio
 import hashlib
+import json
 import os
 import random
 import re
 import time
+import xml.etree.ElementTree as ET
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -27,13 +40,21 @@ from openai import AsyncOpenAI
 from sqlite_utils.db import Table
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+try:
+    from ._token_usage import _log_token_usage
+except ImportError:
+    from pathlib import Path as _P
+    import sys as _sys
+    _sys.path.insert(0, str(_P(__file__).resolve().parent))
+    from _token_usage import _log_token_usage
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
 BASE_URL = "https://www.pdpc.gov.sg"
-PRESS_ROOM_URL = f"{BASE_URL}/news-and-events/press-room"
-API_URL = f"{BASE_URL}/api/pdpcpressroom/getpressroomlisting"
+SITEMAP_URL = f"{BASE_URL}/sitemap.xml"
+MEDIA_EVENTS_PATH = "/media-events/"
 
 # Only keep articles published from this date onwards
 START_DATE = date(2026, 1, 1)
@@ -45,8 +66,29 @@ REQUEST_TIMEOUT = 30.0
 MAX_CONSECUTIVE_FAILURES = 5
 MAX_RETRIES = 3
 
+# Mac's residential IP rate-limit awareness: keep a single connection in flight
+# per fetch round. Concurrent loads through the SOCKS5 sidecar all egress via
+# Mac, so politeness here also protects the upstream Tailscale exit.
+HTTP_LIMITS = httpx.Limits(max_connections=2, max_keepalive_connections=2)
+
+# Browser-shaped UA -- CloudFront also fingerprints the agent string
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15"
+)
+
 # LLM concurrency
-_LLM_SEMAPHORE = asyncio.Semaphore(3)
+_LLM_SEMAPHORES = {}
+
+def _get_llm_semaphore() -> asyncio.Semaphore:
+    try:
+        loop = asyncio.get_running_loop()
+        loop_id = id(loop)
+    except RuntimeError:
+        loop_id = 0
+    if loop_id not in _LLM_SEMAPHORES:
+        _LLM_SEMAPHORES[loop_id] = asyncio.Semaphore(3)
+    return _LLM_SEMAPHORES[loop_id]
 
 # =============================================================================
 # SYSTEM PROMPT
@@ -76,7 +118,7 @@ def polite_sleep():
 
 
 def slugify_category(type_str: str) -> str:
-    """Slugify API type field to category value (e.g., 'Media Release' -> 'media-release')."""
+    """Slugify category to slug (e.g., 'Press Room' -> 'press-room')."""
     return re.sub(r"[^a-z0-9]+", "-", type_str.strip().lower()).strip("-")
 
 
@@ -92,127 +134,194 @@ def parse_date_string(date_str: str) -> Optional[str]:
     if m:
         for fmt in ("%d %B %Y", "%d %b %Y"):
             try:
-                return datetime.strptime(f"{m.group(1)} {m.group(2)} {m.group(3)}", fmt).date().isoformat()
+                return datetime.strptime(
+                    f"{m.group(1)} {m.group(2)} {m.group(3)}", fmt
+                ).date().isoformat()
             except ValueError:
                 continue
     return None
 
 
 # =============================================================================
-# API DISCOVERY
+# SITEMAP DISCOVERY
 # =============================================================================
 
 
-def get_csrf_token(client: httpx.Client) -> str:
-    """Fetch the press room page and extract the CSRF token."""
-    click.echo(f"Fetching CSRF token from: {PRESS_ROOM_URL}")
-    response = client.get(PRESS_ROOM_URL)
-    response.raise_for_status()
-    soup = BeautifulSoup(response.content, "lxml")
-    token_input = soup.find("input", {"name": "__RequestVerificationToken"})
-    token = token_input["value"] if token_input else ""
-    if not token:
-        click.echo("Warning: CSRF token not found in page", err=True)
-    return token
+# A trailing year in the slug (e.g. ".../on-9-april-2026", ".../webinar-2022")
+# is a strong hint at the article year. Used to skip obvious pre-START_DATE
+# entries without fetching them. Slugs without a year still get fetched and
+# date-filtered properly via the on-page date.
+_SLUG_YEAR_RE = re.compile(r"-(20\d{2})(?:[-/]|$)")
+
+
+def _max_year_in_slug(url: str) -> Optional[int]:
+    years = [int(m.group(1)) for m in _SLUG_YEAR_RE.finditer(url)]
+    return max(years) if years else None
 
 
 @retry(stop=stop_after_attempt(MAX_RETRIES), wait=wait_exponential(multiplier=2, min=1, max=10))
-def fetch_api_page(client: httpx.Client, token: str, year: str, page: int) -> Dict[str, Any]:
-    """Fetch a single page of results from the PDPC press room API."""
-    response = client.post(
-        API_URL,
-        data={"page": page, "year": year, "type": "all", "keyword": ""},
-        headers={
-            "RequestVerificationToken": token,
-            "X-Requested-With": "XMLHttpRequest",
-        },
-    )
-    response.raise_for_status()
-    return response.json()
-
-
-def discover_items_from_api(client: httpx.Client, token: str, existing_urls: set) -> List[Dict[str, Any]]:
-    """
-    Discover press room items from the PDPC API for 2026 onwards.
-
-    Paginates through all pages for each year from START_DATE.year to current year.
-    Returns items not already in the database.
-    """
-    current_year = date.today().year
-    all_items: List[Dict[str, Any]] = []
-
-    for year in range(START_DATE.year, current_year + 1):
-        year_str = str(year)
-        page = 1
-
-        while True:
-            click.echo(f"Fetching API: year={year_str}, page={page}")
-            polite_sleep()
-
-            try:
-                data = fetch_api_page(client, token, year_str, page)
-            except Exception as e:
-                click.echo(f"API request failed for year={year_str}, page={page}: {e}", err=True)
-                break
-
-            if data.get("ResponseCode") != "OK":
-                click.echo(f"API error: {data.get('Message', 'unknown')}", err=True)
-                break
-
-            items = data.get("items", [])
-            if not items:
-                break
-
-            total_pages = data.get("totalPages", 1)
-
-            for item in items:
-                rel_url = item.get("url", "")
-                full_url = f"{BASE_URL}{rel_url}" if rel_url else ""
-                if full_url and full_url not in existing_urls:
-                    all_items.append(item)
-
-            click.echo(f"  Found {len(items)} items (page {page}/{total_pages})")
-
-            if page >= total_pages:
-                break
-            page += 1
-
-    click.echo(f"Total new items discovered: {len(all_items)}")
-    return all_items
+def fetch_sitemap_urls(client: httpx.Client) -> List[str]:
+    """Fetch the site sitemap and return all /media-events/<slug> URLs."""
+    click.echo(f"Fetching sitemap: {SITEMAP_URL}")
+    resp = client.get(SITEMAP_URL)
+    resp.raise_for_status()
+    root = ET.fromstring(resp.content)
+    ns = {"s": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+    urls: List[str] = []
+    for u in root.findall("s:url", ns):
+        loc = u.findtext("s:loc", namespaces=ns) or ""
+        # /media-events/<slug> only -- skip the listing root /media-events
+        if MEDIA_EVENTS_PATH in loc and not loc.rstrip("/").endswith("/media-events"):
+            urls.append(loc)
+    click.echo(f"Sitemap returned {len(urls)} /media-events/* URLs")
+    return urls
 
 
 # =============================================================================
-# ARTICLE SCRAPING
+# DETAIL PAGE PARSING
 # =============================================================================
 
 
-@retry(stop=stop_after_attempt(MAX_RETRIES), wait=wait_exponential(multiplier=2, min=1, max=10))
-def fetch_article_content(url: str, client: httpx.Client) -> str:
-    """
-    Fetch and extract content text from a PDPC detail page.
+# Pattern for a single self.__next_f.push([N, "<escaped string>"]) call.
+# Captures the escaped string -- caller json-decodes it to the streamed text.
+_NEXT_F_PUSH_RE = re.compile(
+    r'self\.__next_f\.push\(\[\s*\d+\s*,\s*"((?:[^"\\]|\\.)*)"\s*\]\)'
+)
 
-    The content is in the main content area, typically under #mainContent.
-    """
-    response = client.get(url)
-    response.raise_for_status()
-    soup = BeautifulSoup(response.content, "lxml")
 
-    # Try #mainContent first, then fall back to <main> or <body>
-    container = soup.find(id="mainContent") or soup.find("main") or soup.find("body")
-    if not container:
+def _decode_rsc_stream(html: str) -> str:
+    """Concatenate all self.__next_f.push string payloads.
+
+    Next.js App Router emits the RSC stream as a series of these calls. The
+    string args are JSON-escaped fragments; concat in document order to get
+    the full stream that the client would have received.
+    """
+    parts: List[str] = []
+    for esc in _NEXT_F_PUSH_RE.findall(html):
+        try:
+            parts.append(json.loads('"' + esc + '"'))
+        except json.JSONDecodeError:
+            continue
+    return "".join(parts)
+
+
+# Streamed text row marker: "<rowId>:T<hexLen>,<content>" terminated by the
+# next row marker (one or more digits followed by a colon at line start) or
+# end of stream. Used to fish the article body out of the RSC payload.
+_RSC_TEXT_ROW_RE_TEMPLATE = (
+    r"(?:^|\n){row}:T[0-9a-f]+,(.*?)(?=\n\d+:[\[\"{{T]|\Z)"
+)
+
+
+def _extract_article_body_html(rsc: str) -> str:
+    """Extract the article body HTML from the streamed RSC payload.
+
+    Optical detail pages render `<div className="rte"><RscRef content="$N"/></div>`
+    where row N is a streamed text chunk holding the body HTML. We find the
+    first non-cookie content reference and pull its row.
+    """
+    for ref_id in re.findall(r'"content":"\$([\w]+)"', rsc):
+        row_re = re.compile(
+            _RSC_TEXT_ROW_RE_TEMPLATE.format(row=re.escape(ref_id)),
+            re.DOTALL,
+        )
+        m = row_re.search(rsc)
+        if not m:
+            continue
+        body = m.group(1).strip()
+        # Skip the cookie-banner content that also lives in a content ref
+        if "cookie" in body.lower() and len(body) < 500:
+            continue
+        return body
+    return ""
+
+
+def _html_body_to_text(body_html: str) -> str:
+    """Convert the article body HTML to plain text (paragraph-separated)."""
+    if not body_html:
         return ""
-
-    for unwanted in container.find_all(
-        ["nav", "header", "footer", "script", "style", "aside", "form"]
-    ):
-        unwanted.decompose()
-
-    parts = [
-        el.get_text(strip=True)
-        for el in container.find_all(["p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "td"])
-        if len(el.get_text(strip=True)) > 15
-    ]
+    soup = BeautifulSoup(body_html, "lxml")
+    parts: List[str] = []
+    for el in soup.find_all(["p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "td"]):
+        text = el.get_text(strip=True)
+        if len(text) > 15:
+            parts.append(text)
     return "\n\n".join(parts)
+
+
+def parse_detail_page(html: str, url: str) -> Dict[str, Any]:
+    """Parse a /media-events/[slug] page.
+
+    Returns a dict with title, date_text, published_date, category_name,
+    category_slug, content_html, content_text. Missing fields default to ''
+    or None so callers can decide how to handle.
+    """
+    soup = BeautifulSoup(html, "lxml")
+
+    h1 = soup.find("h1")
+    title = h1.get_text(strip=True) if h1 else ""
+
+    # Two layouts on the new site:
+    #   - News-shaped pages (Announcements, Press Room, Advisories, Reports):
+    #     <span class="page-banner__date">Published on 14 Apr 2026</span>
+    #   - Event pages (Events / Webinars):
+    #     <div class="page-banner__event-date">
+    #       <span>icon</span><span>08 Apr 2021</span>
+    #     </div>
+    date_text = ""
+    pub_date: Optional[str] = None
+    date_text_source: Any = soup.find("span", class_="page-banner__date")
+    if date_text_source is None:
+        date_text_source = soup.find("div", class_="page-banner__event-date")
+    if date_text_source is not None:
+        full = date_text_source.get_text(" ", strip=True)
+        m = re.search(r"(\d{1,2}\s+[A-Za-z]+\s+\d{4})", full)
+        if m:
+            date_text = m.group(1)
+            pub_date = parse_date_string(date_text)
+
+    # <div class="page-banner__category"><span>Announcements</span></div>
+    category_name = ""
+    cat_div = soup.find("div", class_="page-banner__category")
+    if cat_div:
+        span = cat_div.find("span")
+        if span:
+            category_name = span.get_text(strip=True)
+    # Fallback: schema.org JSON-LD type
+    if not category_name:
+        for s in soup.find_all("script", type="application/ld+json"):
+            try:
+                d = json.loads(s.string or "{}")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            ctx = d.get("@context", "") or ""
+            if "schema.gov.sg" in ctx:
+                category_name = (d.get("type") or "").strip()
+                if category_name:
+                    break
+
+    rsc = _decode_rsc_stream(html)
+    body_html = _extract_article_body_html(rsc)
+    body_text = _html_body_to_text(body_html)
+
+    return {
+        "url": url,
+        "title": title,
+        "date_text": date_text,
+        "published_date": pub_date,
+        "category_name": category_name,
+        "category_slug": slugify_category(category_name) if category_name else "",
+        "content_html": body_html,
+        "content_text": body_text,
+    }
+
+
+@retry(stop=stop_after_attempt(MAX_RETRIES), wait=wait_exponential(multiplier=2, min=1, max=10))
+def fetch_detail_page(url: str, client: httpx.Client) -> str:
+    """Fetch the raw HTML of a /media-events/[slug] page."""
+    resp = client.get(url)
+    resp.raise_for_status()
+    return resp.text
 
 
 # =============================================================================
@@ -237,7 +346,7 @@ async def get_summary(text: str, title: str) -> str:
     )
     content_snippet = text[:4000] if text else title
 
-    async with _LLM_SEMAPHORE:
+    async with _get_llm_semaphore():
         try:
             response = await client.chat.completions.create(
                 model=model,
@@ -246,6 +355,17 @@ async def get_summary(text: str, title: str) -> str:
                     {"role": "user", "content": f"Summarise this PDPC item:\n\n{content_snippet}"},
                 ],
             )
+            try:
+                _log_token_usage(
+                    agent="sg-gov-newsrooms-zeeker",
+                    endpoint=base_url,
+                    model=model,
+                    prompt_tokens=getattr(response.usage, "prompt_tokens", None),
+                    completion_tokens=getattr(response.usage, "completion_tokens", None),
+                    call_type="pdpc_summary",
+                )
+            except Exception:
+                pass
             return (response.choices[0].message.content or "").strip()
         except Exception as e:
             click.echo(f"  Summary failed: {e}", err=True)
@@ -266,15 +386,25 @@ async def generate_summaries(items: List[Dict[str, Any]]) -> List[Dict[str, Any]
 
 
 def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
-    """
-    Fetch new PDPC press room articles via JSON API discovery.
+    """Fetch new PDPC media-events articles via sitemap discovery.
 
-    Incremental: skips URLs already in DB and articles before START_DATE.
+    Incremental: skips URLs already in DB and articles published before
+    START_DATE. The 2 legacy CWP rows (/news-and-events/press-room/...) won't
+    match any new sitemap URL and will be left as historical orphans.
     """
     existing_urls: set = set()
     if existing_table:
         existing_urls = {row["source_url"] for row in existing_table.rows}
         click.echo(f"Existing records: {len(existing_urls)}")
+
+    # PDPC's CDN does IP-based routing that 403s data-centre IPs. When the
+    # host SOCKS5 sidecar is up, TAILSCALE_PROXY is set in the build env and
+    # routes this fetch via houfu's Mac. When unset (offline/local-dev),
+    # httpx behaves as before -- and PDPC will return 403, signalling the
+    # sidecar is down.
+    proxy = os.environ.get("TAILSCALE_PROXY") or None
+    if proxy:
+        click.echo(f"Routing PDPC fetches via {proxy}")
 
     results: List[Dict[str, Any]] = []
     consecutive_failures = 0
@@ -282,38 +412,59 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
     with httpx.Client(
         timeout=REQUEST_TIMEOUT,
         follow_redirects=True,
-        headers={
-            "User-Agent": "ZeekerBot/1.0 (+https://data.zeeker.sg; sg-gov-newsrooms research bot)"
-        },
-        limits=httpx.Limits(max_connections=5, max_keepalive_connections=3),
+        proxy=proxy,
+        headers={"User-Agent": USER_AGENT},
+        limits=HTTP_LIMITS,
     ) as client:
-        # Step 1: Get CSRF token
         try:
-            token = get_csrf_token(client)
+            sitemap_urls = fetch_sitemap_urls(client)
         except Exception as e:
-            click.echo(f"Failed to get CSRF token: {e}", err=True)
+            click.echo(f"Failed to fetch sitemap: {e}", err=True)
             return []
 
-        # Step 2: Discover items from API
-        api_items = discover_items_from_api(client, token, existing_urls)
+        candidate_urls = [u for u in sitemap_urls if u not in existing_urls]
+        # Cheap pre-filter: skip URLs whose slug carries a year before
+        # START_DATE.year. Slugs without a year fall through to the per-page
+        # date check.
+        pre_filtered: List[str] = []
+        skipped_by_slug = 0
+        for u in candidate_urls:
+            year = _max_year_in_slug(u)
+            if year is not None and year < START_DATE.year:
+                skipped_by_slug += 1
+                continue
+            pre_filtered.append(u)
+        click.echo(
+            f"Sitemap candidates: {len(candidate_urls)} new (of {len(sitemap_urls)}); "
+            f"slug-year filter skipped {skipped_by_slug}; will fetch {len(pre_filtered)}"
+        )
 
-        if not api_items:
+        if not pre_filtered:
             click.echo("No new items to process.")
             return []
+        new_urls = pre_filtered
 
-        # Step 3: Scrape detail pages for content
-        click.echo(f"\nScraping {len(api_items)} articles...")
-        for i, item in enumerate(api_items, 1):
-            rel_url = item.get("url", "")
-            full_url = f"{BASE_URL}{rel_url}"
-            title = item.get("title", "")
-            click.echo(f"[{i}/{len(api_items)}] {full_url}")
+        for i, url in enumerate(new_urls, 1):
+            click.echo(f"[{i}/{len(new_urls)}] {url}")
             polite_sleep()
 
-            # Parse date from API response
-            pub_date = parse_date_string(item.get("date", ""))
+            try:
+                html = fetch_detail_page(url, client)
+                consecutive_failures = 0
+            except Exception as e:
+                click.echo(f"  Failed to fetch: {e}", err=True)
+                consecutive_failures += 1
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    click.echo(
+                        "Circuit breaker triggered -- too many consecutive failures.",
+                        err=True,
+                    )
+                    break
+                continue
 
-            # Filter by date
+            parsed = parse_detail_page(html, url)
+            pub_date = parsed["published_date"]
+
             if pub_date:
                 try:
                     if date.fromisoformat(pub_date) < START_DATE:
@@ -321,30 +472,25 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
                         continue
                 except ValueError:
                     pass
-            elif pub_date is None:
-                click.echo("  Warning: no date found, including anyway")
+            else:
+                click.echo("  Warning: no published date parsed, including anyway")
 
-            # Fetch detail page content
-            content_text = ""
-            try:
-                content_text = fetch_article_content(full_url, client)
-                consecutive_failures = 0
-            except Exception as e:
-                click.echo(f"  Failed to fetch content: {e}", err=True)
-                consecutive_failures += 1
-                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                    click.echo("Circuit breaker triggered -- too many consecutive failures.", err=True)
-                    break
-                # Still include the item with description as fallback
-                content_text = item.get("description", "")
+            if not parsed["title"]:
+                click.echo("  Skipping: no <h1> title found")
+                continue
 
-            category = slugify_category(item.get("type", "other"))
+            content_text = parsed["content_text"]
+            if not content_text:
+                click.echo(
+                    "  Warning: empty body (RSC content stream not found); "
+                    "saving with title-only context"
+                )
 
             result = {
-                "id": make_id(full_url),
-                "source_url": full_url,
-                "category": category,
-                "title": title,
+                "id": make_id(url),
+                "source_url": url,
+                "category": parsed["category_slug"] or "other",
+                "title": parsed["title"],
                 "published_date": pub_date,
                 "content_text": content_text,
                 "summary": "",
@@ -352,8 +498,8 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
             }
             results.append(result)
             click.echo(
-                f"  -> {title[:60]} "
-                f"({pub_date}, {category}, {len(content_text)} chars)"
+                f"  -> {parsed['title'][:60]} "
+                f"({pub_date}, {parsed['category_slug']}, {len(content_text)} chars)"
             )
 
     if not results:
