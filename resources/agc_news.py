@@ -65,7 +65,17 @@ MAX_CONSECUTIVE_FAILURES = 5
 MAX_RETRIES = 3
 
 # LLM concurrency
-_LLM_SEMAPHORE = asyncio.Semaphore(3)
+_LLM_SEMAPHORES = {}
+
+def _get_llm_semaphore() -> asyncio.Semaphore:
+    try:
+        loop = asyncio.get_running_loop()
+        loop_id = id(loop)
+    except RuntimeError:
+        loop_id = 0
+    if loop_id not in _LLM_SEMAPHORES:
+        _LLM_SEMAPHORES[loop_id] = asyncio.Semaphore(3)
+    return _LLM_SEMAPHORES[loop_id]
 
 # =============================================================================
 # SYSTEM PROMPT
@@ -281,7 +291,7 @@ async def get_summary(text: str, title: str) -> str:
     )
     content_snippet = text[:4000] if text else title
 
-    async with _LLM_SEMAPHORE:
+    async with _get_llm_semaphore():
         try:
             response = await client.chat.completions.create(
                 model=model,
