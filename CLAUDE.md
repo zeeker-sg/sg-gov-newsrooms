@@ -148,73 +148,24 @@ All resources in this collection follow these principles:
 
 ---
 
-## Build Monitoring Guide (for AI agents)
+## Build monitoring
 
-This section helps AI agents monitoring the build pipeline interpret log output correctly.
+Operational documentation — status-line grammar, Skip kinds (`up_to_date` /
+`blocked`), `__zeeker_report__` counters (`skipped=` / `failed=`), per-resource
+cadence and yields, failure modes, and backlog SQL — lives in **[RUNBOOK.md](RUNBOOK.md)**.
+Monitoring agents should parse builds against that contract (or `zeeker build --json`),
+not ad-hoc log scraping.
 
-### Self-describing log format
+Development notes worth keeping in mind here:
 
-Every log line from the 8 resource modules is prefixed with its resource name
-(e.g. `acra_news: Fetching sitemap: ...`, `  acra_news: [3/12] https://...` — indentation is
-preserved before the prefix). Failures are attributable per resource without duration
-guesswork. Errors and degradation warnings go to **stderr**; progress lines go to stdout.
-
-Each resource emits exactly one terminal status line per run:
-
-- **Healthy (any yield, including zero):**
-  `{resource}: done — {new} new, {skipped} skipped, {failed} failed` (stdout)
-  `skipped` counts per-run in-loop skips (pre-START_DATE dates, missing titles);
-  `failed` counts per-article fetch failures.
-- **Discovery failure or circuit-breaker abort:**
-  `{resource}: ABORTED ({reason}) — {new} new, {failed} failed` (stderr)
-  `reason` includes the exception class and message, e.g.
-  `ABORTED (discovery failed: ConnectError: ...)` or
-  `ABORTED (circuit breaker: TimeoutError: ...)`. An ABORTED run may still return
-  partial results (`new` > 0) collected before the abort.
-- **pdpc_news proxy fast-skip:**
-  `pdpc_news: SKIPPED (blocked: TAILSCALE_PROXY unset — proxy required for PDPC CloudFront)` (stderr)
-  Emitted immediately (sub-second) when the proxy env var is unset — no doomed
-  sitemap retries.
-
-The circuit breaker message is standardized across all 8 modules (stderr):
-
-```
-{resource}: circuit breaker tripped — {n} consecutive failures (last: {ExceptionType}: {message})
-```
-
-So: a run that ends in `done — 0 new, ...` is a healthy empty; anything abnormal ends in
-`ABORTED (...)` or `SKIPPED (blocked: ...)`. "No data returned" without one of these lines
-should no longer occur.
-
-### Resources
-
-This repo has 8 resources, all scraping Singapore government websites. Most do NOT require a proxy. **`pdpc_news` is the exception — it requires the Tailscale SOCKS5 proxy** (`TAILSCALE_PROXY`) because PDPC uses CloudFront which blocks datacenter IPs. When the proxy env var is unset, pdpc_news fast-skips with the `SKIPPED (blocked: ...)` line above; when the proxy is set but the sidecar/exit node is down, expect `pdpc_news: ABORTED (sitemap fetch failed: RetryError: ...)` after ~20–200s of retries. The Tailscale exit node (ASUS router) must be online for this resource to work.
-
-| Resource | Source | Proxy? | Typical yield |
-|----------|--------|--------|---------------|
-| `mlaw_news` | mlaw.gov.sg Atom feed | No | ~2–5 new/week |
-| `judiciary_news` | judiciary.gov.sg AJAX API | No | ~3–10 new/week |
-| `agc_news` | agc.gov.sg sitemap | No | ~1–3 new/week |
-| `ipos_news` | ipos.gov.sg listing page | No | ~1–3 new/week |
-| `ccs_news` | ccs.gov.sg listing page | No | ~1–3 new/week |
-| `acra_news` | acra.gov.sg sitemap | No | ~2–5 new/week |
-| `mom_news` | mom.gov.sg sitemap | No | ~2–5 new/week |
-| `pdpc_news` | pdpc.gov.sg sitemap | **Yes** | ~1–2 new/month |
-
-### Normal yield expectations
-
-- **All resources combined:** 0–5 new articles per day (government news is slow)
-- **Most common pattern:** All 8 resources report `done — 0 new, 0 skipped, 0 failed` — normal on most days
-- **Build duration:** 5–30s when all up to date (the pdpc_news fast-skip removes the old ~110s proxy-timeout tail when the proxy is unconfigured)
-
-### Current DB stats (as of Jul 2026)
-
-- mlaw_news: ~50 rows
-- judiciary_news: ~34 rows
-- agc_news: ~295 rows
-- ipos_news: ~12 rows
-- ccs_news: ~16 rows
-- acra_news: ~367 rows
-- mom_news: ~64 rows
-- pdpc_news: ~16 rows
-- **Total: ~854 rows**
+- Requires **zeeker >= 0.9.0**: resources raise `from zeeker import Skip` on
+  blocked preconditions, report counters via a module-level `__zeeker_report__`
+  dict, and use plain top-level sibling imports (`from _isomer import ...`,
+  `from _token_usage import ...`) — resources/ is on `sys.path` only while the
+  module loads, so keep sibling imports at the top level (lazy in-function
+  imports of siblings will fail).
+- `fetch_data` runs ONCE per build per resource under 0.9.0 — no module reload,
+  no second call for a fragments phase.
+- Never wrap a `raise Skip(...)` inside a tenacity-retried helper — raise it
+  from `fetch_data` itself (as the modules do now), or the skip would be
+  retried and resurface as a RetryError failure.

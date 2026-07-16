@@ -27,15 +27,11 @@ from bs4 import BeautifulSoup
 from openai import AsyncOpenAI
 from sqlite_utils.db import Table
 from tenacity import retry, stop_after_attempt, wait_exponential
+from zeeker import Skip
 
-try:
-    from ._token_usage import _log_token_usage
-except ImportError:
-    from pathlib import Path as _P
-    import sys as _sys
-
-    _sys.path.insert(0, str(_P(__file__).resolve().parent))
-    from _token_usage import _log_token_usage
+# Sibling import — zeeker >= 0.9.0 puts resources/ on sys.path during module
+# load, so no sys.path shim is needed.
+from _token_usage import _log_token_usage
 
 # =============================================================================
 # CONFIGURATION
@@ -421,7 +417,7 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
                 f"ABORTED (discovery failed: {type(e).__name__}: {e}) — 0 new, 0 failed",
                 err=True,
             )
-            return []
+            raise Skip(f"discovery failed: {type(e).__name__}: {e}", kind="blocked")
 
         if not new_urls:
             _echo("No new URLs to process.")
@@ -487,11 +483,23 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
         summaries_ok = sum(1 for r in results if r.get("summary"))
         _echo(f"{summaries_ok} of {len(results)} summaries generated.")
 
+    # Surface per-run counters on zeeker's status line / --json output
+    global __zeeker_report__
+    report: Dict[str, int] = {}
+    if skipped:
+        report["skipped"] = skipped
+    if failed:
+        report["failed"] = failed
+    if report:
+        __zeeker_report__ = report
+
     if abort_reason:
         _echo(
             f"ABORTED ({abort_reason}) — {len(results)} new, {failed} failed",
             err=True,
         )
+        if not results:
+            raise Skip(abort_reason, kind="blocked")
     else:
         _echo(f"done — {len(results)} new, {skipped} skipped, {failed} failed")
     return results

@@ -26,15 +26,6 @@ from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 from xml.etree import ElementTree
 
-try:
-    from ._token_usage import _log_token_usage
-except ImportError:
-    from pathlib import Path as _P
-    import sys as _sys
-
-    _sys.path.insert(0, str(_P(__file__).resolve().parent))
-    from _token_usage import _log_token_usage
-
 import click
 import httpx
 from bs4 import BeautifulSoup
@@ -42,6 +33,11 @@ from openai import AsyncOpenAI
 from sqlite_utils.db import Table
 from tenacity import retry, stop_after_attempt, wait_exponential
 from urllib.parse import urlparse
+from zeeker import Skip
+
+# Sibling import — zeeker >= 0.9.0 puts resources/ on sys.path during module
+# load, so no sys.path shim is needed.
+from _token_usage import _log_token_usage
 
 # =============================================================================
 # CONFIGURATION
@@ -536,7 +532,7 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
                 f"ABORTED (discovery failed: {type(e).__name__}: {e}) — 0 new, 0 failed",
                 err=True,
             )
-            return []
+            raise Skip(f"discovery failed: {type(e).__name__}: {e}", kind="blocked")
 
         if not new_items:
             _echo("No new items to process.")
