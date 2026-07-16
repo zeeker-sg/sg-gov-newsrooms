@@ -31,6 +31,7 @@ try:
 except ImportError:
     from pathlib import Path as _P
     import sys as _sys
+
     _sys.path.insert(0, str(_P(__file__).resolve().parent))
     from _token_usage import _log_token_usage
 
@@ -46,9 +47,19 @@ from urllib.parse import urlparse
 # CONFIGURATION
 # =============================================================================
 
+RESOURCE_NAME = "mlaw_news"
+
+
+def _echo(message: str, err: bool = False) -> None:
+    """click.echo with the resource name prefixed (kept after leading whitespace)."""
+    stripped = message.lstrip(" \n")
+    leading = message[: len(message) - len(stripped)]
+    click.echo(f"{leading}{RESOURCE_NAME}: {stripped}", err=err)
+
+
 BASE_URL = "https://www.mlaw.gov.sg"
 SITEMAP_URL = "https://www.mlaw.gov.sg/sitemap.xml"  # Stale (only up to 2024) — kept for reference
-FEED_URL = "https://www.mlaw.gov.sg/feed.xml"        # Live Atom feed — used for discovery
+FEED_URL = "https://www.mlaw.gov.sg/feed.xml"  # Live Atom feed — used for discovery
 NEWS_PREFIX = "/news/"
 
 # Only import articles published from this date onwards
@@ -64,6 +75,7 @@ MAX_RETRIES = 3
 # LLM concurrency — local Ollama handles one inference at a time
 _LLM_SEMAPHORES = {}
 
+
 def _get_llm_semaphore() -> asyncio.Semaphore:
     try:
         loop = asyncio.get_running_loop()
@@ -73,6 +85,7 @@ def _get_llm_semaphore() -> asyncio.Semaphore:
     if loop_id not in _LLM_SEMAPHORES:
         _LLM_SEMAPHORES[loop_id] = asyncio.Semaphore(3)
     return _LLM_SEMAPHORES[loop_id]
+
 
 # Known news categories (URL path segments under /news/)
 NEWS_CATEGORIES = {
@@ -148,10 +161,18 @@ def parse_date_string(date_str: str) -> Optional[str]:
     m = re.search(r"(\d{1,2})\s+([A-Za-z]+)\s+(20\d{2})", date_str)
     if m:
         try:
-            return datetime.strptime(f"{m.group(1)} {m.group(2)} {m.group(3)}", "%d %B %Y").date().isoformat()
+            return (
+                datetime.strptime(f"{m.group(1)} {m.group(2)} {m.group(3)}", "%d %B %Y")
+                .date()
+                .isoformat()
+            )
         except ValueError:
             try:
-                return datetime.strptime(f"{m.group(1)} {m.group(2)} {m.group(3)}", "%d %b %Y").date().isoformat()
+                return (
+                    datetime.strptime(f"{m.group(1)} {m.group(2)} {m.group(3)}", "%d %b %Y")
+                    .date()
+                    .isoformat()
+                )
             except ValueError:
                 pass
     return None
@@ -171,7 +192,7 @@ def extract_category_from_content(html_content: str) -> str:
     for a in soup.find_all("a", href=True):
         href = a["href"]
         if href.startswith("/news/"):
-            path_part = href[len("/news/"):].strip("/")
+            path_part = href[len("/news/") :].strip("/")
             if path_part in NEWS_CATEGORIES:
                 return path_part
     return "other"
@@ -215,21 +236,15 @@ def discover_news_from_feed(client: httpx.Client, existing_urls: set) -> List[Di
     need a different approach (scraping the /news/ listing pages).
 
     Returns list of dicts with: source_url, category, published_date, title, content_text
+
+    Raises on fetch/parse failure so fetch_data can emit an ABORTED status line.
     """
-    click.echo(f"Fetching feed: {FEED_URL}")
-    try:
-        response = client.get(FEED_URL)
-        response.raise_for_status()
-    except httpx.HTTPError as e:
-        click.echo(f"Failed to fetch feed: {e}", err=True)
-        return []
+    _echo(f"Fetching feed: {FEED_URL}")
+    response = client.get(FEED_URL)
+    response.raise_for_status()
 
     ns = {"atom": "http://www.w3.org/2005/Atom"}
-    try:
-        root = ElementTree.fromstring(response.content)
-    except ElementTree.ParseError as e:
-        click.echo(f"Failed to parse feed XML: {e}", err=True)
-        return []
+    root = ElementTree.fromstring(response.content)
 
     items = []
     skipped_date = 0
@@ -270,15 +285,17 @@ def discover_news_from_feed(client: httpx.Client, existing_urls: set) -> List[Di
         category = extract_category_from_content(raw_html)
         content_text = extract_content_from_feed_html(raw_html)
 
-        items.append({
-            "source_url": url,
-            "category": category,
-            "published_date": published_date.isoformat() if published_date else None,
-            "title": title,
-            "content_text": content_text,
-        })
+        items.append(
+            {
+                "source_url": url,
+                "category": category,
+                "published_date": published_date.isoformat() if published_date else None,
+                "title": title,
+                "content_text": content_text,
+            }
+        )
 
-    click.echo(
+    _echo(
         f"Feed: {len(items) + skipped_date + skipped_existing} entries. "
         f"{skipped_date} before {START_DATE}, {skipped_existing} already in DB, "
         f"{len(items)} new to process."
@@ -331,9 +348,12 @@ def fetch_article(url: str, client: httpx.Client) -> Dict[str, Any]:
     if not published_date:
         page_text = soup.get_text(" ", strip=True)
         # Look for "8 April 2026" or "08 Apr 2026" patterns
-        m = re.search(r"\b(\d{1,2}\s+(?:January|February|March|April|May|June|July|August|"
-                      r"September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|"
-                      r"Jul|Aug|Sep|Oct|Nov|Dec)\s+20\d{2})\b", page_text)
+        m = re.search(
+            r"\b(\d{1,2}\s+(?:January|February|March|April|May|June|July|August|"
+            r"September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|"
+            r"Jul|Aug|Sep|Oct|Nov|Dec)\s+20\d{2})\b",
+            page_text,
+        )
         if m:
             published_date = parse_date_string(m.group(1))
 
@@ -377,34 +397,35 @@ async def _backfill_empty_summaries(existing_table: Optional[Table]) -> None:
         return
 
     try:
-        rows = list(existing_table.db.execute(
-            f"SELECT id, title, content_text FROM [{existing_table.name}] "
-            "WHERE summary IS NULL OR summary = '' OR summary = 'None'"
-        ))
+        rows = list(
+            existing_table.db.execute(
+                f"SELECT id, title, content_text FROM [{existing_table.name}] "
+                "WHERE summary IS NULL OR summary = '' OR summary = 'None'"
+            )
+        )
     except Exception as e:
-        click.echo(f"Backfill: could not query empty summaries: {e}", err=True)
+        _echo(f"Backfill: could not query empty summaries: {e}", err=True)
         return
 
     if not rows:
         return
 
-    click.echo(f"Backfill: found {len(rows)} articles with empty summaries — regenerating")
+    _echo(f"Backfill: found {len(rows)} articles with empty summaries — regenerating")
 
     async def _fix_one(row_id: str, title: str, content_text: str) -> None:
         text = content_text or title
         try:
             summary = await get_summary(text, title)
             existing_table.db.execute(
-                f"UPDATE [{existing_table.name}] SET summary = ? WHERE id = ?",
-                [summary, row_id]
+                f"UPDATE [{existing_table.name}] SET summary = ? WHERE id = ?", [summary, row_id]
             )
-            click.echo(f"  → Backfilled summary for: {title[:60]}")
+            _echo(f"  → Backfilled summary for: {title[:60]}")
         except Exception as e:
-            click.echo(f"  → Backfill failed for {title[:60]}: {e}", err=True)
+            _echo(f"  → Backfill failed for {title[:60]}: {e}", err=True)
 
     tasks = [asyncio.create_task(_fix_one(r[0], r[1], r[2])) for r in rows]
     await asyncio.gather(*tasks)
-    click.echo(f"Backfill: done ({len(rows)} articles processed)")
+    _echo(f"Backfill: done ({len(rows)} articles processed)")
 
 
 async def get_summary(text: str, title: str) -> str:
@@ -414,7 +435,7 @@ async def get_summary(text: str, title: str) -> str:
     model = os.environ.get("LLM_MODEL", "")
 
     if not base_url:
-        click.echo("  LLM_BASE_URL not set — skipping summary", err=True)
+        _echo("  LLM_BASE_URL not set — skipping summary", err=True)
         return ""
 
     client = AsyncOpenAI(
@@ -433,7 +454,10 @@ async def get_summary(text: str, title: str) -> str:
                 model=model,
                 messages=[
                     {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
-                    {"role": "user", "content": f"Summarise this Ministry of Law item:\n\n{content_snippet}"},
+                    {
+                        "role": "user",
+                        "content": f"Summarise this Ministry of Law item:\n\n{content_snippet}",
+                    },
                 ],
             )
             try:
@@ -450,7 +474,7 @@ async def get_summary(text: str, title: str) -> str:
             summary = response.choices[0].message.content or ""
             return summary.strip()
         except Exception as e:
-            click.echo(f"  Summary failed: {e}", err=True)
+            _echo(f"  Summary failed: {e}", err=True)
             return ""
 
 
@@ -461,7 +485,7 @@ async def generate_summaries(items: List[Dict[str, Any]]) -> List[Dict[str, Any]
 
     for item, summary in zip(items, summaries):
         if isinstance(summary, Exception):
-            click.echo(f"  Summary error for '{item['title'][:50]}': {summary}", err=True)
+            _echo(f"  Summary error for '{item['title'][:50]}': {summary}", err=True)
             item["summary"] = ""
         else:
             item["summary"] = summary
@@ -490,7 +514,7 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
     existing_urls: set = set()
     if existing_table:
         existing_urls = {row["source_url"] for row in existing_table.rows}
-        click.echo(f"Existing records: {len(existing_urls)}")
+        _echo(f"Existing records: {len(existing_urls)}")
 
     results: List[Dict[str, Any]] = []
     consecutive_failures = 0
@@ -499,25 +523,31 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
         timeout=REQUEST_TIMEOUT,
         follow_redirects=True,
         headers={
-            "User-Agent": (
-                "ZeekerBot/1.0 (+https://data.zeeker.sg; sg-gov-newsrooms research bot)"
-            )
+            "User-Agent": ("ZeekerBot/1.0 (+https://data.zeeker.sg; sg-gov-newsrooms research bot)")
         },
         limits=httpx.Limits(max_connections=5, max_keepalive_connections=3),
     ) as client:
 
         # Phase 1: Discover new articles from Atom feed (includes full content)
-        new_items = discover_news_from_feed(client, existing_urls)
+        try:
+            new_items = discover_news_from_feed(client, existing_urls)
+        except Exception as e:
+            _echo(
+                f"ABORTED (discovery failed: {type(e).__name__}: {e}) — 0 new, 0 failed",
+                err=True,
+            )
+            return []
 
         if not new_items:
-            click.echo("No new items to process.")
+            _echo("No new items to process.")
+            _echo("done — 0 new, 0 skipped, 0 failed")
             return []
 
         # Phase 2: Build result records (content already extracted from feed)
-        click.echo(f"\nProcessing {len(new_items)} articles from feed...")
+        _echo(f"\nProcessing {len(new_items)} articles from feed...")
         for i, item in enumerate(new_items, 1):
             url = item["source_url"]
-            click.echo(f"[{i}/{len(new_items)}] {url}")
+            _echo(f"[{i}/{len(new_items)}] {url}")
 
             result = {
                 "id": make_id(url),
@@ -530,21 +560,23 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
             results.append(result)
-            click.echo(
+            _echo(
                 f"  → {item['title'][:60]} "
                 f"({item['published_date']}, {len(item['content_text'])} chars)"
             )
 
     if not results:
-        click.echo("No articles successfully scraped.")
+        _echo("No articles successfully scraped.")
+        _echo("done — 0 new, 0 skipped, 0 failed")
         return []
 
     # Phase 3: Generate AI summaries (async, semaphore-bounded)
-    click.echo(f"\nGenerating summaries for {len(results)} articles...")
+    _echo(f"\nGenerating summaries for {len(results)} articles...")
     results = asyncio.run(generate_summaries(results))
 
     summaries_ok = sum(1 for r in results if r.get("summary"))
-    click.echo(f"\nDone: {len(results)} new articles, {summaries_ok} with summaries.")
+    _echo(f"\n{summaries_ok} of {len(results)} summaries generated.")
+    _echo(f"done — {len(results)} new, 0 skipped, 0 failed")
     return results
 
 

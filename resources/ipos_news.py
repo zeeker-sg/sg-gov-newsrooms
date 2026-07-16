@@ -32,6 +32,7 @@ try:
 except ImportError:
     from pathlib import Path as _P
     import sys as _sys
+
     _sys.path.insert(0, str(_P(__file__).resolve().parent))
     from _isomer import parse_isomer_listing_dates, parse_isomer_listing_items, normalize_url
 
@@ -40,12 +41,23 @@ try:
 except ImportError:
     from pathlib import Path as _P
     import sys as _sys
+
     _sys.path.insert(0, str(_P(__file__).resolve().parent))
     from _token_usage import _log_token_usage
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+
+RESOURCE_NAME = "ipos_news"
+
+
+def _echo(message: str, err: bool = False) -> None:
+    """click.echo with the resource name prefixed (kept after leading whitespace)."""
+    stripped = message.lstrip(" \n")
+    leading = message[: len(message) - len(stripped)]
+    click.echo(f"{leading}{RESOURCE_NAME}: {stripped}", err=err)
+
 
 BASE_URL = "https://www.ipos.gov.sg"
 LISTING_URL = "https://www.ipos.gov.sg/news/news-collection/"
@@ -63,6 +75,7 @@ MAX_RETRIES = 3
 # LLM concurrency
 _LLM_SEMAPHORES = {}
 
+
 def _get_llm_semaphore() -> asyncio.Semaphore:
     try:
         loop = asyncio.get_running_loop()
@@ -72,6 +85,7 @@ def _get_llm_semaphore() -> asyncio.Semaphore:
     if loop_id not in _LLM_SEMAPHORES:
         _LLM_SEMAPHORES[loop_id] = asyncio.Semaphore(3)
     return _LLM_SEMAPHORES[loop_id]
+
 
 # =============================================================================
 # SYSTEM PROMPT
@@ -132,7 +146,11 @@ def parse_date_string(date_str: str) -> Optional[str]:
     if m:
         for fmt in ("%d %B %Y", "%d %b %Y"):
             try:
-                return datetime.strptime(f"{m.group(1)} {m.group(2)} {m.group(3)}", fmt).date().isoformat()
+                return (
+                    datetime.strptime(f"{m.group(1)} {m.group(2)} {m.group(3)}", fmt)
+                    .date()
+                    .isoformat()
+                )
             except ValueError:
                 continue
     return None
@@ -149,20 +167,18 @@ def discover_urls_from_listing(client: httpx.Client, existing_urls: set) -> List
 
     Isomer embeds all article data (path, date, title, category) in the React
     Server Component payload. No pagination needed — all items are on page 1.
+
+    Raises on fetch failure so fetch_data can emit an ABORTED status line.
     """
-    click.echo(f"Fetching listing page: {LISTING_URL}")
-    try:
-        response = client.get(LISTING_URL)
-        response.raise_for_status()
-    except httpx.HTTPError as e:
-        click.echo(f"Failed to fetch listing page: {e}", err=True)
-        return []
+    _echo(f"Fetching listing page: {LISTING_URL}")
+    response = client.get(LISTING_URL)
+    response.raise_for_status()
 
     items = parse_isomer_listing_items(
         response.text,
         "/news/news-collection/",
     )
-    click.echo(f"RSC payload: {len(items)} articles found.")
+    _echo(f"RSC payload: {len(items)} articles found.")
 
     all_items: List[Dict[str, Any]] = []
     skipped_old = 0
@@ -177,14 +193,16 @@ def discover_urls_from_listing(client: httpx.Client, existing_urls: set) -> List
                 continue
         except (ValueError, KeyError):
             pass
-        all_items.append({
-            "source_url": url,
-            "title": item["title"],
-            "published_date": item["date"],
-            "category": item["category"],
-        })
+        all_items.append(
+            {
+                "source_url": url,
+                "title": item["title"],
+                "published_date": item["date"],
+                "category": item["category"],
+            }
+        )
 
-    click.echo(
+    _echo(
         f"Discovered {len(all_items)} new article URLs"
         f" ({skipped_old} skipped, before {START_DATE})."
     )
@@ -277,7 +295,7 @@ async def get_summary(text: str, title: str) -> str:
     model = os.environ.get("LLM_MODEL", "")
 
     if not base_url:
-        click.echo("  LLM_BASE_URL not set — skipping summary", err=True)
+        _echo("  LLM_BASE_URL not set — skipping summary", err=True)
         return ""
 
     client = AsyncOpenAI(
@@ -310,7 +328,7 @@ async def get_summary(text: str, title: str) -> str:
                 pass
             return (response.choices[0].message.content or "").strip()
         except Exception as e:
-            click.echo(f"  Summary failed: {e}", err=True)
+            _echo(f"  Summary failed: {e}", err=True)
             return ""
 
 
@@ -336,10 +354,13 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
     existing_urls: set = set()
     if existing_table:
         existing_urls = {normalize_url(row["source_url"]) for row in existing_table.rows}
-        click.echo(f"Existing records: {len(existing_urls)}")
+        _echo(f"Existing records: {len(existing_urls)}")
 
     results: List[Dict[str, Any]] = []
     consecutive_failures = 0
+    skipped = 0
+    failed = 0
+    abort_reason: Optional[str] = None
 
     with httpx.Client(
         timeout=REQUEST_TIMEOUT,
@@ -349,26 +370,40 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
         },
         limits=httpx.Limits(max_connections=5, max_keepalive_connections=3),
     ) as client:
-        discovered = discover_urls_from_listing(client, existing_urls)
-
-        if not discovered:
-            click.echo("No new URLs to process.")
+        try:
+            discovered = discover_urls_from_listing(client, existing_urls)
+        except Exception as e:
+            _echo(
+                f"ABORTED (discovery failed: {type(e).__name__}: {e}) — 0 new, 0 failed",
+                err=True,
+            )
             return []
 
-        click.echo(f"\nScraping {len(discovered)} articles...")
+        if not discovered:
+            _echo("No new URLs to process.")
+            _echo("done — 0 new, 0 skipped, 0 failed")
+            return []
+
+        _echo(f"\nScraping {len(discovered)} articles...")
         for i, item in enumerate(discovered, 1):
             url = item["source_url"]
-            click.echo(f"[{i}/{len(discovered)}] {url}")
+            _echo(f"[{i}/{len(discovered)}] {url}")
             polite_sleep()
 
             try:
                 article = fetch_article(url, client)
                 consecutive_failures = 0
             except Exception as e:
-                click.echo(f"  Failed: {e}", err=True)
+                _echo(f"  Failed: {e}", err=True)
+                failed += 1
                 consecutive_failures += 1
                 if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                    click.echo("Circuit breaker triggered — too many consecutive failures.", err=True)
+                    abort_reason = f"circuit breaker: {type(e).__name__}: {e}"
+                    _echo(
+                        f"circuit breaker tripped — {consecutive_failures} consecutive failures "
+                        f"(last: {type(e).__name__}: {e})",
+                        err=True,
+                    )
                     break
                 continue
 
@@ -377,12 +412,13 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
             if pub_date:
                 try:
                     if date.fromisoformat(pub_date) < START_DATE:
-                        click.echo(f"  Skipping (before {START_DATE}): {pub_date}")
+                        _echo(f"  Skipping (before {START_DATE}): {pub_date}")
+                        skipped += 1
                         continue
                 except ValueError:
                     pass
             elif pub_date is None:
-                click.echo("  Warning: no date found, including anyway")
+                _echo("  Warning: no date found, including anyway", err=True)
 
             title = article.get("title") or item.get("title", "")
             category = infer_category(url, title, item.get("category", ""))
@@ -398,20 +434,24 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
             results.append(result)
-            click.echo(
+            _echo(
                 f"  → {title[:60]} "
                 f"({pub_date}, {category}, {len(article.get('content_text', ''))} chars)"
             )
 
-    if not results:
-        click.echo("No articles scraped.")
-        return []
+    if results:
+        _echo(f"\nGenerating summaries for {len(results)} articles...")
+        results = asyncio.run(generate_summaries(results))
+        summaries_ok = sum(1 for r in results if r.get("summary"))
+        _echo(f"{summaries_ok} of {len(results)} summaries generated.")
 
-    click.echo(f"\nGenerating summaries for {len(results)} articles...")
-    results = asyncio.run(generate_summaries(results))
-
-    summaries_ok = sum(1 for r in results if r.get("summary"))
-    click.echo(f"\nDone: {len(results)} new articles, {summaries_ok} with summaries.")
+    if abort_reason:
+        _echo(
+            f"ABORTED ({abort_reason}) — {len(results)} new, {failed} failed",
+            err=True,
+        )
+    else:
+        _echo(f"done — {len(results)} new, {skipped} skipped, {failed} failed")
     return results
 
 

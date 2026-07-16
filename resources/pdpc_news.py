@@ -45,12 +45,23 @@ try:
 except ImportError:
     from pathlib import Path as _P
     import sys as _sys
+
     _sys.path.insert(0, str(_P(__file__).resolve().parent))
     from _token_usage import _log_token_usage
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+
+RESOURCE_NAME = "pdpc_news"
+
+
+def _echo(message: str, err: bool = False) -> None:
+    """click.echo with the resource name prefixed (kept after leading whitespace)."""
+    stripped = message.lstrip(" \n")
+    leading = message[: len(message) - len(stripped)]
+    click.echo(f"{leading}{RESOURCE_NAME}: {stripped}", err=err)
+
 
 BASE_URL = "https://www.pdpc.gov.sg"
 SITEMAP_URL = f"{BASE_URL}/sitemap.xml"
@@ -80,6 +91,7 @@ USER_AGENT = (
 # LLM concurrency
 _LLM_SEMAPHORES = {}
 
+
 def _get_llm_semaphore() -> asyncio.Semaphore:
     try:
         loop = asyncio.get_running_loop()
@@ -89,6 +101,7 @@ def _get_llm_semaphore() -> asyncio.Semaphore:
     if loop_id not in _LLM_SEMAPHORES:
         _LLM_SEMAPHORES[loop_id] = asyncio.Semaphore(3)
     return _LLM_SEMAPHORES[loop_id]
+
 
 # =============================================================================
 # SYSTEM PROMPT
@@ -134,9 +147,11 @@ def parse_date_string(date_str: str) -> Optional[str]:
     if m:
         for fmt in ("%d %B %Y", "%d %b %Y"):
             try:
-                return datetime.strptime(
-                    f"{m.group(1)} {m.group(2)} {m.group(3)}", fmt
-                ).date().isoformat()
+                return (
+                    datetime.strptime(f"{m.group(1)} {m.group(2)} {m.group(3)}", fmt)
+                    .date()
+                    .isoformat()
+                )
             except ValueError:
                 continue
     return None
@@ -162,7 +177,7 @@ def _max_year_in_slug(url: str) -> Optional[int]:
 @retry(stop=stop_after_attempt(MAX_RETRIES), wait=wait_exponential(multiplier=2, min=1, max=10))
 def fetch_sitemap_urls(client: httpx.Client) -> List[str]:
     """Fetch the site sitemap and return all /media-events/<slug> URLs."""
-    click.echo(f"Fetching sitemap: {SITEMAP_URL}")
+    _echo(f"Fetching sitemap: {SITEMAP_URL}")
     resp = client.get(SITEMAP_URL)
     resp.raise_for_status()
     root = ET.fromstring(resp.content)
@@ -173,7 +188,7 @@ def fetch_sitemap_urls(client: httpx.Client) -> List[str]:
         # /media-events/<slug> only -- skip the listing root /media-events
         if MEDIA_EVENTS_PATH in loc and not loc.rstrip("/").endswith("/media-events"):
             urls.append(loc)
-    click.echo(f"Sitemap returned {len(urls)} /media-events/* URLs")
+    _echo(f"Sitemap returned {len(urls)} /media-events/* URLs")
     return urls
 
 
@@ -184,9 +199,7 @@ def fetch_sitemap_urls(client: httpx.Client) -> List[str]:
 
 # Pattern for a single self.__next_f.push([N, "<escaped string>"]) call.
 # Captures the escaped string -- caller json-decodes it to the streamed text.
-_NEXT_F_PUSH_RE = re.compile(
-    r'self\.__next_f\.push\(\[\s*\d+\s*,\s*"((?:[^"\\]|\\.)*)"\s*\]\)'
-)
+_NEXT_F_PUSH_RE = re.compile(r'self\.__next_f\.push\(\[\s*\d+\s*,\s*"((?:[^"\\]|\\.)*)"\s*\]\)')
 
 
 def _decode_rsc_stream(html: str) -> str:
@@ -208,9 +221,7 @@ def _decode_rsc_stream(html: str) -> str:
 # Streamed text row marker: "<rowId>:T<hexLen>,<content>" terminated by the
 # next row marker (one or more digits followed by a colon at line start) or
 # end of stream. Used to fish the article body out of the RSC payload.
-_RSC_TEXT_ROW_RE_TEMPLATE = (
-    r"(?:^|\n){row}:T[0-9a-f]+,(.*?)(?=\n\d+:[\[\"{{T]|\Z)"
-)
+_RSC_TEXT_ROW_RE_TEMPLATE = r"(?:^|\n){row}:T[0-9a-f]+,(.*?)(?=\n\d+:[\[\"{{T]|\Z)"
 
 
 def _extract_article_body_html(rsc: str) -> str:
@@ -335,7 +346,7 @@ async def get_summary(text: str, title: str) -> str:
     model = os.environ.get("LLM_MODEL", "")
 
     if not base_url:
-        click.echo("  LLM_BASE_URL not set -- skipping summary", err=True)
+        _echo("  LLM_BASE_URL not set -- skipping summary", err=True)
         return ""
 
     client = AsyncOpenAI(
@@ -368,7 +379,7 @@ async def get_summary(text: str, title: str) -> str:
                 pass
             return (response.choices[0].message.content or "").strip()
         except Exception as e:
-            click.echo(f"  Summary failed: {e}", err=True)
+            _echo(f"  Summary failed: {e}", err=True)
             return ""
 
 
@@ -395,19 +406,27 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
     existing_urls: set = set()
     if existing_table:
         existing_urls = {row["source_url"] for row in existing_table.rows}
-        click.echo(f"Existing records: {len(existing_urls)}")
+        _echo(f"Existing records: {len(existing_urls)}")
 
-    # PDPC's CDN does IP-based routing that 403s data-centre IPs. When the
-    # host SOCKS5 sidecar is up, TAILSCALE_PROXY is set in the build env and
-    # routes this fetch via houfu's Mac. When unset (offline/local-dev),
-    # httpx behaves as before -- and PDPC will return 403, signalling the
-    # sidecar is down.
+    # PDPC's CDN does IP-based routing that 403s data-centre IPs, so every
+    # fetch must exit via the host SOCKS5 sidecar (TAILSCALE_PROXY, routed
+    # through houfu's Mac). Without the proxy every request is doomed to
+    # 403s / retry timeouts, so skip immediately instead of burning ~2
+    # minutes of retries that look like a mysterious empty result.
     proxy = os.environ.get("TAILSCALE_PROXY") or None
-    if proxy:
-        click.echo(f"Routing PDPC fetches via {proxy}")
+    if not proxy:
+        _echo(
+            "SKIPPED (blocked: TAILSCALE_PROXY unset — proxy required for PDPC CloudFront)",
+            err=True,
+        )
+        return []
+    _echo(f"Routing PDPC fetches via {proxy}")
 
     results: List[Dict[str, Any]] = []
     consecutive_failures = 0
+    skipped = 0
+    failed = 0
+    abort_reason: Optional[str] = None
 
     with httpx.Client(
         timeout=REQUEST_TIMEOUT,
@@ -419,7 +438,10 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
         try:
             sitemap_urls = fetch_sitemap_urls(client)
         except Exception as e:
-            click.echo(f"Failed to fetch sitemap: {e}", err=True)
+            _echo(
+                f"ABORTED (sitemap fetch failed: {type(e).__name__}: {e}) — 0 new, 0 failed",
+                err=True,
+            )
             return []
 
         candidate_urls = [u for u in sitemap_urls if u not in existing_urls]
@@ -434,29 +456,33 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
                 skipped_by_slug += 1
                 continue
             pre_filtered.append(u)
-        click.echo(
+        _echo(
             f"Sitemap candidates: {len(candidate_urls)} new (of {len(sitemap_urls)}); "
             f"slug-year filter skipped {skipped_by_slug}; will fetch {len(pre_filtered)}"
         )
 
         if not pre_filtered:
-            click.echo("No new items to process.")
+            _echo("No new items to process.")
+            _echo("done — 0 new, 0 skipped, 0 failed")
             return []
         new_urls = pre_filtered
 
         for i, url in enumerate(new_urls, 1):
-            click.echo(f"[{i}/{len(new_urls)}] {url}")
+            _echo(f"[{i}/{len(new_urls)}] {url}")
             polite_sleep()
 
             try:
                 html = fetch_detail_page(url, client)
                 consecutive_failures = 0
             except Exception as e:
-                click.echo(f"  Failed to fetch: {e}", err=True)
+                _echo(f"  Failed to fetch: {e}", err=True)
+                failed += 1
                 consecutive_failures += 1
                 if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                    click.echo(
-                        "Circuit breaker triggered -- too many consecutive failures.",
+                    abort_reason = f"circuit breaker: {type(e).__name__}: {e}"
+                    _echo(
+                        f"circuit breaker tripped — {consecutive_failures} consecutive failures "
+                        f"(last: {type(e).__name__}: {e})",
                         err=True,
                     )
                     break
@@ -468,22 +494,25 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
             if pub_date:
                 try:
                     if date.fromisoformat(pub_date) < START_DATE:
-                        click.echo(f"  Skipping (before {START_DATE}): {pub_date}")
+                        _echo(f"  Skipping (before {START_DATE}): {pub_date}")
+                        skipped += 1
                         continue
                 except ValueError:
                     pass
             else:
-                click.echo("  Warning: no published date parsed, including anyway")
+                _echo("  Warning: no published date parsed, including anyway", err=True)
 
             if not parsed["title"]:
-                click.echo("  Skipping: no <h1> title found")
+                _echo("  Skipping: no <h1> title found", err=True)
+                skipped += 1
                 continue
 
             content_text = parsed["content_text"]
             if not content_text:
-                click.echo(
+                _echo(
                     "  Warning: empty body (RSC content stream not found); "
-                    "saving with title-only context"
+                    "saving with title-only context",
+                    err=True,
                 )
 
             result = {
@@ -497,20 +526,24 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
             results.append(result)
-            click.echo(
+            _echo(
                 f"  -> {parsed['title'][:60]} "
                 f"({pub_date}, {parsed['category_slug']}, {len(content_text)} chars)"
             )
 
-    if not results:
-        click.echo("No articles scraped.")
-        return []
+    if results:
+        _echo(f"\nGenerating summaries for {len(results)} articles...")
+        results = asyncio.run(generate_summaries(results))
+        summaries_ok = sum(1 for r in results if r.get("summary"))
+        _echo(f"{summaries_ok} of {len(results)} summaries generated.")
 
-    click.echo(f"\nGenerating summaries for {len(results)} articles...")
-    results = asyncio.run(generate_summaries(results))
-
-    summaries_ok = sum(1 for r in results if r.get("summary"))
-    click.echo(f"\nDone: {len(results)} new articles, {summaries_ok} with summaries.")
+    if abort_reason:
+        _echo(
+            f"ABORTED ({abort_reason}) — {len(results)} new, {failed} failed",
+            err=True,
+        )
+    else:
+        _echo(f"done — {len(results)} new, {skipped} skipped, {failed} failed")
     return results
 
 

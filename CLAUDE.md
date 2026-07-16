@@ -152,36 +152,60 @@ All resources in this collection follow these principles:
 
 This section helps AI agents monitoring the build pipeline interpret log output correctly.
 
-### Resources and what "no data returned" means
+### Self-describing log format
 
-This repo has 8 resources, all scraping Singapore government websites. Most do NOT require a proxy. **`pdpc_news` is the exception — it requires the Tailscale SOCKS5 proxy** because PDPC uses CloudFront which blocks datacenter IPs.
+Every log line from the 8 resource modules is prefixed with its resource name
+(e.g. `acra_news: Fetching sitemap: ...`, `  acra_news: [3/12] https://...` — indentation is
+preserved before the prefix). Failures are attributable per resource without duration
+guesswork. Errors and degradation warnings go to **stderr**; progress lines go to stdout.
 
-| Resource | Source | Proxy? | Normal "no data" cause | Abnormal "no data" cause |
-|----------|--------|--------|----------------------|------------------------|
-| `mlaw_news` | mlaw.gov.sg sitemap | No | All 2026+ articles already imported (~2–5 new/week) | Sitemap unreachable, circuit breaker tripped |
-| `judiciary_news` | judiciary.gov.sg AJAX API | No | All 2026+ articles already imported (~3–10/week) | API endpoint changed, connection timeout |
-| `agc_news` | agc.gov.sg sitemap | No | All 2026+ articles already imported | Sitemap unreachable |
-| `ipos_news` | ipos.gov.sg paginated listing | No | All 2026+ articles already imported (~1–3/week) | Listing page structure changed |
-| `ccs_news` | ccs.gov.sg paginated listing | No | All 2026+ articles already imported (~1–3/week) | Listing page structure changed |
-| `acra_news` | acra.gov.sg sitemap | No | All 2026+ announcements already imported | Sitemap unreachable |
-| `mom_news` | mom.gov.sg sitemap | No | All 2026+ press releases already imported | Sitemap unreachable |
-| `pdpc_news` | pdpc.gov.sg sitemap | **Yes** | All 2026+ articles already imported | **ProxyError** — `Failed to fetch sitemap: RetryError[ProxyError]`. Duration 20–200s. |
+Each resource emits exactly one terminal status line per run:
 
-### The pdpc_news trap
+- **Healthy (any yield, including zero):**
+  `{resource}: done — {new} new, {skipped} skipped, {failed} failed` (stdout)
+  `skipped` counts per-run in-loop skips (pre-START_DATE dates, missing titles);
+  `failed` counts per-article fetch failures.
+- **Discovery failure or circuit-breaker abort:**
+  `{resource}: ABORTED ({reason}) — {new} new, {failed} failed` (stderr)
+  `reason` includes the exception class and message, e.g.
+  `ABORTED (discovery failed: ConnectError: ...)` or
+  `ABORTED (circuit breaker: TimeoutError: ...)`. An ABORTED run may still return
+  partial results (`new` > 0) collected before the abort.
+- **pdpc_news proxy fast-skip:**
+  `pdpc_news: SKIPPED (blocked: TAILSCALE_PROXY unset — proxy required for PDPC CloudFront)` (stderr)
+  Emitted immediately (sub-second) when the proxy env var is unset — no doomed
+  sitemap retries.
 
-`pdpc_news` is the most common source of disguised failures in this repo. It shows as `[SKIP] pdpc_news no data returned (109.4s)` — the 109-second duration (vs 0.2s for other resources) is the telltale sign of proxy retries timing out. The Tailscale exit node (ASUS router) must be online for this resource to work.
+The circuit breaker message is standardized across all 8 modules (stderr):
+
+```
+{resource}: circuit breaker tripped — {n} consecutive failures (last: {ExceptionType}: {message})
+```
+
+So: a run that ends in `done — 0 new, ...` is a healthy empty; anything abnormal ends in
+`ABORTED (...)` or `SKIPPED (blocked: ...)`. "No data returned" without one of these lines
+should no longer occur.
+
+### Resources
+
+This repo has 8 resources, all scraping Singapore government websites. Most do NOT require a proxy. **`pdpc_news` is the exception — it requires the Tailscale SOCKS5 proxy** (`TAILSCALE_PROXY`) because PDPC uses CloudFront which blocks datacenter IPs. When the proxy env var is unset, pdpc_news fast-skips with the `SKIPPED (blocked: ...)` line above; when the proxy is set but the sidecar/exit node is down, expect `pdpc_news: ABORTED (sitemap fetch failed: RetryError: ...)` after ~20–200s of retries. The Tailscale exit node (ASUS router) must be online for this resource to work.
+
+| Resource | Source | Proxy? | Typical yield |
+|----------|--------|--------|---------------|
+| `mlaw_news` | mlaw.gov.sg Atom feed | No | ~2–5 new/week |
+| `judiciary_news` | judiciary.gov.sg AJAX API | No | ~3–10 new/week |
+| `agc_news` | agc.gov.sg sitemap | No | ~1–3 new/week |
+| `ipos_news` | ipos.gov.sg listing page | No | ~1–3 new/week |
+| `ccs_news` | ccs.gov.sg listing page | No | ~1–3 new/week |
+| `acra_news` | acra.gov.sg sitemap | No | ~2–5 new/week |
+| `mom_news` | mom.gov.sg sitemap | No | ~2–5 new/week |
+| `pdpc_news` | pdpc.gov.sg sitemap | **Yes** | ~1–2 new/month |
 
 ### Normal yield expectations
 
 - **All resources combined:** 0–5 new articles per day (government news is slow)
-- **Most common pattern:** All 8 resources return "no data returned" — this is normal on most days
-- **Build duration:** 5–30s when all up to date, 100–150s when pdpc_news is timing out
-
-### How to tell a healthy skip from a failure
-
-- **Healthy skip:** Duration 0.1–2s, no error messages in surrounding log lines
-- **Failed skip (pdpc_news proxy):** Duration 20–200s, log shows `Failed to fetch sitemap: RetryError[<Future ... raised ProxyError>]`
-- **Failed skip (other resource):** Duration >5s, log shows `circuit breaker`, `RetryError`, or `ConnectError`
+- **Most common pattern:** All 8 resources report `done — 0 new, 0 skipped, 0 failed` — normal on most days
+- **Build duration:** 5–30s when all up to date (the pdpc_news fast-skip removes the old ~110s proxy-timeout tail when the proxy is unconfigured)
 
 ### Current DB stats (as of Jul 2026)
 
