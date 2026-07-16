@@ -39,12 +39,23 @@ try:
 except ImportError:
     from pathlib import Path as _P
     import sys as _sys
+
     _sys.path.insert(0, str(_P(__file__).resolve().parent))
     from _token_usage import _log_token_usage
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+
+RESOURCE_NAME = "judiciary_news"
+
+
+def _echo(message: str, err: bool = False) -> None:
+    """click.echo with the resource name prefixed (kept after leading whitespace)."""
+    stripped = message.lstrip(" \n")
+    leading = message[: len(message) - len(stripped)]
+    click.echo(f"{leading}{RESOURCE_NAME}: {stripped}", err=err)
+
 
 BASE_URL = "https://www.judiciary.gov.sg"
 LISTING_URL = "https://www.judiciary.gov.sg/news-and-resources/news"
@@ -63,6 +74,7 @@ MAX_RETRIES = 3
 # LLM concurrency
 _LLM_SEMAPHORES = {}
 
+
 def _get_llm_semaphore() -> asyncio.Semaphore:
     try:
         loop = asyncio.get_running_loop()
@@ -72,6 +84,7 @@ def _get_llm_semaphore() -> asyncio.Semaphore:
     if loop_id not in _LLM_SEMAPHORES:
         _LLM_SEMAPHORES[loop_id] = asyncio.Semaphore(3)
     return _LLM_SEMAPHORES[loop_id]
+
 
 # CADENCE: Daily (Tier 1)
 # judiciary.gov.sg publishes ~3–10 news items per week
@@ -136,6 +149,7 @@ def fetch_listing_page(
 
     Returns list of dicts with: source_url, title, published_date, content_type, courts.
     Returns empty list when no items are found (pagination exhausted).
+    Raises on HTTP/JSON failure so fetch_data can emit an ABORTED status line.
     """
     payload = {
         "model": {
@@ -148,21 +162,17 @@ def fetch_listing_page(
         }
     }
 
-    try:
-        response = client.post(
-            FILTERED_LIST_URL,
-            content=json.dumps(payload),
-            headers={
-                "Content-Type": "application/json; charset=utf-8",
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer": LISTING_URL,
-            },
-        )
-        response.raise_for_status()
-        data = response.json()
-    except (httpx.HTTPError, ValueError) as e:
-        click.echo(f"  Listing page {page} failed: {e}", err=True)
-        return []
+    response = client.post(
+        FILTERED_LIST_URL,
+        content=json.dumps(payload),
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": LISTING_URL,
+        },
+    )
+    response.raise_for_status()
+    data = response.json()
 
     list_html = data.get("listPartialView", "")
     soup = BeautifulSoup(list_html, "lxml")
@@ -195,13 +205,15 @@ def fetch_listing_page(
             elif text and not re.search(r"\d{4}", text):
                 content_type = text
 
-        items.append({
-            "source_url": source_url,
-            "title": title,
-            "published_date": published_date,
-            "content_type": content_type,
-            "courts": courts,
-        })
+        items.append(
+            {
+                "source_url": source_url,
+                "title": title,
+                "published_date": published_date,
+                "content_type": content_type,
+                "courts": courts,
+            }
+        )
 
     return items
 
@@ -223,21 +235,21 @@ def discover_news(
 
     for year in range(start_year, current_year + 1):
         year_str = str(year)
-        click.echo(f"\nDiscovering {year_str} content...")
+        _echo(f"\nDiscovering {year_str} content...")
         page = 0
 
         while True:
-            click.echo(f"  Fetching page {page + 1} of {year_str}...")
+            _echo(f"  Fetching page {page + 1} of {year_str}...")
             items = fetch_listing_page(client, page, year_str)
 
             if not items:
-                click.echo(f"  No more items on page {page + 1} — done with {year_str}.")
+                _echo(f"  No more items on page {page + 1} — done with {year_str}.")
                 break
 
             new_items = [i for i in items if i["source_url"] not in existing_urls]
             all_new.extend(new_items)
 
-            click.echo(
+            _echo(
                 f"  Page {page + 1}: {len(items)} items, "
                 f"{len(new_items)} new, {len(items) - len(new_items)} already in DB."
             )
@@ -245,7 +257,7 @@ def discover_news(
             # If all items on this page are already in DB, stop paginating this year
             # (listing is newest-first; all older items will also be in DB)
             if not new_items:
-                click.echo(f"  All items on page already in DB — stopping pagination for {year_str}.")
+                _echo(f"  All items on page already in DB — stopping pagination for {year_str}.")
                 break
 
             page += 1
@@ -311,7 +323,7 @@ async def get_summary(text: str, title: str) -> str:
     model = os.environ.get("LLM_MODEL", "")
 
     if not base_url:
-        click.echo("  LLM_BASE_URL not set — skipping summary", err=True)
+        _echo("  LLM_BASE_URL not set — skipping summary", err=True)
         return ""
 
     client = AsyncOpenAI(
@@ -329,7 +341,10 @@ async def get_summary(text: str, title: str) -> str:
                 model=model,
                 messages=[
                     {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
-                    {"role": "user", "content": f"Summarise this Singapore judiciary news item:\n\n{content_snippet}"},
+                    {
+                        "role": "user",
+                        "content": f"Summarise this Singapore judiciary news item:\n\n{content_snippet}",
+                    },
                 ],
             )
             try:
@@ -346,7 +361,7 @@ async def get_summary(text: str, title: str) -> str:
             summary = response.choices[0].message.content or ""
             return summary.strip()
         except Exception as e:
-            click.echo(f"  Summary failed: {e}", err=True)
+            _echo(f"  Summary failed: {e}", err=True)
             return ""
 
 
@@ -357,7 +372,7 @@ async def generate_summaries(items: List[Dict[str, Any]]) -> List[Dict[str, Any]
 
     for item, summary in zip(items, summaries):
         if isinstance(summary, Exception):
-            click.echo(f"  Summary error for '{item['title'][:50]}': {summary}", err=True)
+            _echo(f"  Summary error for '{item['title'][:50]}': {summary}", err=True)
             item["summary"] = ""
         else:
             item["summary"] = summary
@@ -383,45 +398,58 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
     existing_urls: set = set()
     if existing_table:
         existing_urls = {row["source_url"] for row in existing_table.rows}
-        click.echo(f"Existing records: {len(existing_urls)}")
+        _echo(f"Existing records: {len(existing_urls)}")
 
     results: List[Dict[str, Any]] = []
     consecutive_failures = 0
+    skipped = 0
+    failed = 0
+    abort_reason: Optional[str] = None
 
     with httpx.Client(
         timeout=REQUEST_TIMEOUT,
         follow_redirects=True,
         headers={
-            "User-Agent": (
-                "ZeekerBot/1.0 (+https://data.zeeker.sg; sg-gov-newsrooms research bot)"
-            )
+            "User-Agent": ("ZeekerBot/1.0 (+https://data.zeeker.sg; sg-gov-newsrooms research bot)")
         },
         limits=httpx.Limits(max_connections=5, max_keepalive_connections=3),
     ) as client:
 
         # Phase 1: Discover new articles from listing endpoint
-        new_items = discover_news(client, existing_urls, start_year=START_DATE.year)
+        try:
+            new_items = discover_news(client, existing_urls, start_year=START_DATE.year)
+        except Exception as e:
+            _echo(
+                f"ABORTED (discovery failed: {type(e).__name__}: {e}) — 0 new, 0 failed",
+                err=True,
+            )
+            return []
 
         if not new_items:
-            click.echo("No new items to process.")
+            _echo("No new items to process.")
+            _echo("done — 0 new, 0 skipped, 0 failed")
             return []
 
         # Phase 2: Fetch full content from detail pages
-        click.echo(f"\nFetching content for {len(new_items)} articles...")
+        _echo(f"\nFetching content for {len(new_items)} articles...")
         for i, item in enumerate(new_items, 1):
             url = item["source_url"]
-            click.echo(f"[{i}/{len(new_items)}] {url}")
+            _echo(f"[{i}/{len(new_items)}] {url}")
 
             try:
                 content_text = fetch_article_content(url, client)
                 consecutive_failures = 0
             except Exception as e:
-                click.echo(f"  Content fetch failed: {e}", err=True)
+                _echo(f"  Content fetch failed: {e}", err=True)
                 content_text = ""
+                failed += 1
                 consecutive_failures += 1
                 if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                    click.echo(
-                        f"  {consecutive_failures} consecutive failures — stopping.", err=True
+                    abort_reason = f"circuit breaker: {type(e).__name__}: {e}"
+                    _echo(
+                        f"circuit breaker tripped — {consecutive_failures} consecutive failures "
+                        f"(last: {type(e).__name__}: {e})",
+                        err=True,
                     )
                     break
 
@@ -437,7 +465,7 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
             results.append(result)
-            click.echo(
+            _echo(
                 f"  → {item['title'][:60]} "
                 f"({item['published_date']}, {len(content_text)} chars)"
             )
@@ -445,16 +473,20 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
             if i < len(new_items):
                 polite_sleep()
 
-    if not results:
-        click.echo("No articles successfully scraped.")
-        return []
-
     # Phase 3: Generate AI summaries (async, semaphore-bounded)
-    click.echo(f"\nGenerating summaries for {len(results)} articles...")
-    results = asyncio.run(generate_summaries(results))
+    if results:
+        _echo(f"\nGenerating summaries for {len(results)} articles...")
+        results = asyncio.run(generate_summaries(results))
+        summaries_ok = sum(1 for r in results if r.get("summary"))
+        _echo(f"{summaries_ok} of {len(results)} summaries generated.")
 
-    summaries_ok = sum(1 for r in results if r.get("summary"))
-    click.echo(f"\nDone: {len(results)} new articles, {summaries_ok} with summaries.")
+    if abort_reason:
+        _echo(
+            f"ABORTED ({abort_reason}) — {len(results)} new, {failed} failed",
+            err=True,
+        )
+    else:
+        _echo(f"done — {len(results)} new, {skipped} skipped, {failed} failed")
     return results
 
 
