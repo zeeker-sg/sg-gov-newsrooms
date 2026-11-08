@@ -10,6 +10,7 @@ from datetime import date, datetime
 import httpx
 import pytest
 import sqlite_utils
+import tenacity
 from conftest import PROJECT_ROOT, load_module, read_fixture, read_fixture_bytes
 
 TOML = tomllib.loads((PROJECT_ROOT / "zeeker.toml").read_text("utf-8"))["resource"]
@@ -143,3 +144,33 @@ def test_zeeker_toml_sections_cover_resource(name: str) -> None:
     assert cfg["sort_desc"] in cfg["columns"]
     assert all(f in cfg["columns"] for f in cfg["fts_fields"])
     assert all(f in cfg["columns"] for f in cfg["facets"])
+
+
+def test_judiciary_skips_item_when_detail_fetch_fails(patch_client, monkeypatch) -> None:
+    # A failed detail fetch must not produce an empty-content row: discovery skips
+    # URLs already in the table, so a stored empty row would never be retried.
+    mod = load_module("judiciary_news")
+    # Same retry policy, no real backoff sleeping.
+    monkeypatch.setattr(
+        mod,
+        "fetch_article_content",
+        mod.fetch_article_content.retry_with(wait=tenacity.wait_none()),
+    )
+    base = _router("judiciary_news")
+    all_urls = [r["source_url"] for r in mod_rows(patch_client, mod, base)]
+    broken = all_urls[0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and str(request.url).rstrip("/") == broken.rstrip("/"):
+            return httpx.Response(404)
+        return base(request)
+
+    rows = mod_rows(patch_client, mod, handler)
+    assert [r["source_url"] for r in rows] == all_urls[1:]
+    assert all(r["content_text"] for r in rows)
+    assert mod.__zeeker_report__ == {"failed": 1}
+
+
+def mod_rows(patch_client, mod, handler):
+    patch_client(mod, handler)
+    return mod.fetch_data(None)

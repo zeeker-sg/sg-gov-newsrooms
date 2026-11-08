@@ -436,8 +436,9 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
                 content_text = fetch_article_content(url, client)
                 consecutive_failures = 0
             except Exception as e:
+                # Skip rather than store an empty row: discovery filters on
+                # existing_urls, so a stored empty row would never be retried.
                 _echo(f"  Content fetch failed: {e}", err=True)
-                content_text = ""
                 failed += 1
                 consecutive_failures += 1
                 if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
@@ -448,6 +449,7 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
                         err=True,
                     )
                     break
+                continue
 
             result = {
                 "id": make_id(url),
