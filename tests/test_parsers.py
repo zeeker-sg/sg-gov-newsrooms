@@ -107,6 +107,18 @@ def test_mlaw_discovery_from_feed(mock_client) -> None:
     assert all(i["source_url"].startswith("https://www.mlaw.gov.sg/") for i in items)
     known = {items[0]["source_url"]}
     assert len(mlaw.discover_news_from_feed(client, known)) == 2
+    # The "<date> Posted in <category>" byline is metadata, not article text.
+    for item in items:
+        assert "Posted in" not in item["content_text"]
+        assert item["content_text"]
+
+
+def test_mlaw_metadata_line_filter() -> None:
+    assert mlaw._is_metadata_line("4 November 2026Posted inSpeeches")
+    assert mlaw._is_metadata_line("4 November 2026 Posted in Press Releases")
+    assert mlaw._is_metadata_line("Posted in Speeches")
+    assert mlaw._is_metadata_line("Last updated on 3 November 2026")
+    assert not mlaw._is_metadata_line("The Ministry has posted information in its annual report.")
 
 
 def test_mlaw_fetch_article_page(mock_client) -> None:
@@ -114,6 +126,7 @@ def test_mlaw_fetch_article_page(mock_client) -> None:
     art = mlaw.fetch_article("https://www.mlaw.gov.sg/x/", mock_client(_page("mlaw_article.html")))
     assert art["title"].startswith("Speech by Senior Parliamentary Secretary")
     assert art["published_date"] == "2026-11-04"
+    assert "Posted in" not in art["content_text"]
 
 
 def test_agc_sitemap_discovery(mock_client) -> None:

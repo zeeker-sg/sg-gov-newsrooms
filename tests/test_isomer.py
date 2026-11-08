@@ -8,7 +8,7 @@ from conftest import load_module, read_fixture
 
 isomer = load_module("_isomer")
 
-# Payload shape the item regex expects: category and title directly after date.
+# Older payload shape: flat category string directly after date.
 LEGACY_PAYLOAD = (
     '<script>self.__next_f.push([1,"{\\"items\\":['
     '{\\"id\\":\\"/news/a-story\\",\\"date\\":\\"$D2026-03-05T00:00:00.000Z\\",'
@@ -24,7 +24,7 @@ def test_normalize_url_strips_trailing_slash() -> None:
     assert isomer.normalize_url("https://x.gov.sg/a") == "https://x.gov.sg/a"
 
 
-def test_listing_items_regex_matches_expected_shape_and_prefix() -> None:
+def test_listing_items_legacy_shape_and_prefix() -> None:
     items = isomer.parse_isomer_listing_items(LEGACY_PAYLOAD, "/news/")
     assert items == [
         {
@@ -59,19 +59,54 @@ def test_listing_dates_from_real_agc_payload() -> None:
     assert all(len(d) == 10 and d.startswith("2026-") for d in dates.values())
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Live Isomer payloads now put a 'plaintextTags' array between 'date' and 'title', so "
-        "parse_isomer_listing_items matches nothing and ipos_news/ccs_news/acra_news discover "
-        "0 items. Remove this marker once the parser is fixed."
-    ),
-)
-def test_listing_items_regex_against_real_ipos_payload() -> None:
+def test_listing_items_from_real_ipos_payload() -> None:
+    # Live payloads put 'plaintextTags' between 'date' and 'title' and carry the
+    # category in a tag group; the parser must not depend on field order.
     items = isomer.parse_isomer_listing_items(
         read_fixture("ipos_listing.html"), "/news/news-collection/"
     )
     assert len(items) == 4
+    assert items[0] == {
+        "path": "/news/news-collection/singapores-strong-innovation-foundations-recognised-globally",
+        "date": "2026-09-29",
+        "category": "Media releases",
+        "title": "Singapore’s strong innovation foundations recognised globally  ",
+    }
+
+
+def test_listing_items_from_real_agc_payload() -> None:
+    items = isomer.parse_isomer_listing_items(read_fixture("agc_listing.html"), "/newsroom/")
+    assert len(items) == 4
+    first = items[0]
+    assert first["path"].startswith("/newsroom/16th-china-asean-prosecutors-general-conference")
+    assert first["date"] == "2026-10-22"
+    assert first["category"] == "Speeches"
+    assert first["title"].startswith("16th China-ASEAN Prosecutors General Conference 2026")
+
+
+@pytest.mark.parametrize(
+    "fixture,prefix",
+    [("ipos_listing.html", "/news/news-collection/"), ("agc_listing.html", "/newsroom/")],
+)
+def test_listing_items_agree_with_listing_dates(fixture: str, prefix: str) -> None:
+    html = read_fixture(fixture)
+    items = isomer.parse_isomer_listing_items(html, prefix)
+    dates = {p: d for p, d in isomer.parse_isomer_listing_dates(html).items() if p.startswith(prefix)}
+    assert {i["path"]: i["date"] for i in items} == dates
+
+
+def test_listing_items_category_from_tag_group_and_dedup() -> None:
+    # ACRA-style item: empty plaintextTags, several tag groups, only "Category" counts.
+    item = (
+        '{\\"id\\":\\"/n/a\\",\\"date\\":\\"$D2026-11-06T00:00:00.000Z\\",'
+        '\\"plaintextTags\\":[],\\"title\\":\\"A\\",\\"tags\\":['
+        '{\\"id\\":\\"x\\",\\"category\\":\\"Audience\\",\\"selected\\":[\\"Public\\"]},'
+        '{\\"id\\":\\"y\\",\\"category\\":\\"Category\\",\\"selected\\":[\\"Press release\\"]}]}'
+    )
+    html = '<script>self.__next_f.push([1,"{\\"items\\":[%s,%s]}"])</script>' % (item, item)
+    assert isomer.parse_isomer_listing_items(html, "/n/") == [
+        {"path": "/n/a", "date": "2026-11-06", "category": "Press release", "title": "A"}
+    ]
 
 
 def test_fetch_listing_dates_builds_absolute_urls_and_filters_prefix(mock_client) -> None:
