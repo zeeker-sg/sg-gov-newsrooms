@@ -194,6 +194,17 @@ def extract_category_from_content(html_content: str) -> str:
     return "other"
 
 
+# Byline/footer lines that are page metadata, not article text, e.g.
+# "4 November 2026 Posted in Speeches" and "Last updated on 3 November 2026".
+_METADATA_LINE_RE = re.compile(
+    r"^(?:\d{1,2}\s*[A-Za-z]+\s*\d{4}\s*)?Posted in|^Last updated on"
+)
+
+
+def _is_metadata_line(text: str) -> bool:
+    return bool(_METADATA_LINE_RE.match(text))
+
+
 def extract_content_from_feed_html(html_content: str) -> str:
     """
     Extract clean article text from the HTML content inside a feed entry.
@@ -205,16 +216,10 @@ def extract_content_from_feed_html(html_content: str) -> str:
     for unwanted in soup.find_all(["nav", "header", "footer", "script", "style", "aside"]):
         unwanted.decompose()
 
-    # Remove "Posted in" paragraph (category label, not content)
-    for p in soup.find_all("p"):
-        text = p.get_text(strip=True)
-        if text.startswith("Posted in") or text.startswith("Last updated on"):
-            p.decompose()
-
     parts = []
     for el in soup.find_all(["p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "td"]):
         text = el.get_text(strip=True)
-        if text and len(text) > 15:
+        if text and len(text) > 15 and not _is_metadata_line(text):
             parts.append(text)
 
     return "\n\n".join(parts)
@@ -368,7 +373,8 @@ def fetch_article(url: str, client: httpx.Client) -> Dict[str, Any]:
             parts = []
             for el in container.find_all(["p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "td"]):
                 text = el.get_text(strip=True)
-                if text and len(text) > 15:  # Skip very short fragments
+                # Skip very short fragments and the date/category byline
+                if text and len(text) > 15 and not _is_metadata_line(text):
                     parts.append(text)
 
             content_text = "\n\n".join(parts)

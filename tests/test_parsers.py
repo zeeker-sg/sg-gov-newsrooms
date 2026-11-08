@@ -52,6 +52,20 @@ def test_judiciary_article_parsing(mock_client) -> None:
     assert len(text) > 5000
 
 
+def test_judiciary_article_with_div_only_body(mock_client) -> None:
+    # Media advisories put the body in bare <div>s; the p/li/td pass found nothing
+    # and stored empty content_text in production.
+    text = judiciary.fetch_article_content(
+        "https://www.judiciary.gov.sg/x", mock_client(_page("judiciary_article_divs.html"))
+    )
+    paras = text.split("\n\n")
+    assert len(paras) == 4
+    assert paras[0].startswith("1.")
+    assert "special sitting of the Criminal Mentions Court" in paras[0]
+    assert paras[-1].startswith("4.")
+    assert "Topics" not in text and "Court proceedings" not in text
+
+
 def test_judiciary_listing_parsing(mock_client) -> None:
     client = mock_client(
         lambda r: httpx.Response(200, content=read_fixture_bytes("judiciary_list.json"))
@@ -107,6 +121,18 @@ def test_mlaw_discovery_from_feed(mock_client) -> None:
     assert all(i["source_url"].startswith("https://www.mlaw.gov.sg/") for i in items)
     known = {items[0]["source_url"]}
     assert len(mlaw.discover_news_from_feed(client, known)) == 2
+    # The "<date> Posted in <category>" byline is metadata, not article text.
+    for item in items:
+        assert "Posted in" not in item["content_text"]
+        assert item["content_text"]
+
+
+def test_mlaw_metadata_line_filter() -> None:
+    assert mlaw._is_metadata_line("4 November 2026Posted inSpeeches")
+    assert mlaw._is_metadata_line("4 November 2026 Posted in Press Releases")
+    assert mlaw._is_metadata_line("Posted in Speeches")
+    assert mlaw._is_metadata_line("Last updated on 3 November 2026")
+    assert not mlaw._is_metadata_line("The Ministry has posted information in its annual report.")
 
 
 def test_mlaw_fetch_article_page(mock_client) -> None:
@@ -114,6 +140,7 @@ def test_mlaw_fetch_article_page(mock_client) -> None:
     art = mlaw.fetch_article("https://www.mlaw.gov.sg/x/", mock_client(_page("mlaw_article.html")))
     assert art["title"].startswith("Speech by Senior Parliamentary Secretary")
     assert art["published_date"] == "2026-11-04"
+    assert "Posted in" not in art["content_text"]
 
 
 def test_agc_sitemap_discovery(mock_client) -> None:
