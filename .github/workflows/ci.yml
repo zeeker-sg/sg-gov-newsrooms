@@ -1,9 +1,10 @@
 # Smoke-test CI gate for the zeeker resource collection.
 #
-# Runs the tests in tests/ — currently just tests/test_smoke.py, which imports
-# every resources/*.py module and asserts the entry points zeeker's builder
-# needs (fetch_data, and fetch_fragments_data for fragment-enabled resources).
-# Cheap (no network I/O), so it runs on every push to main and every PR.
+# Runs the whole offline suite in tests/: tests/test_smoke.py (imports every
+# resources/*.py module and asserts the entry points zeeker's builder needs)
+# plus parser, HTTP/retry, LLM-stub and row-shape tests built on saved fixtures
+# in tests/fixtures/. No network I/O (enforced by tests/conftest.py), so it
+# runs on every push to main and every PR, including Dependabot bumps.
 
 name: CI
 
