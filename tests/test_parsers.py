@@ -52,6 +52,20 @@ def test_judiciary_article_parsing(mock_client) -> None:
     assert len(text) > 5000
 
 
+def test_judiciary_article_with_div_only_body(mock_client) -> None:
+    # Media advisories put the body in bare <div>s; the p/li/td pass found nothing
+    # and stored empty content_text in production.
+    text = judiciary.fetch_article_content(
+        "https://www.judiciary.gov.sg/x", mock_client(_page("judiciary_article_divs.html"))
+    )
+    paras = text.split("\n\n")
+    assert len(paras) == 4
+    assert paras[0].startswith("1.")
+    assert "special sitting of the Criminal Mentions Court" in paras[0]
+    assert paras[-1].startswith("4.")
+    assert "Topics" not in text and "Court proceedings" not in text
+
+
 def test_judiciary_listing_parsing(mock_client) -> None:
     client = mock_client(
         lambda r: httpx.Response(200, content=read_fixture_bytes("judiciary_list.json"))

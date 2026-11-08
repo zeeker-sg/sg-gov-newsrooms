@@ -293,8 +293,10 @@ def fetch_article_content(url: str, client: httpx.Client) -> str:
     if not container:
         return ""
 
-    # Remove unwanted elements
+    # Remove unwanted elements (".topics" is the "Topics:" tag box under the body)
     for unwanted in container.find_all(["nav", "header", "footer", "script", "style", "aside"]):
+        unwanted.decompose()
+    for unwanted in container.select(".topics"):
         unwanted.decompose()
 
     # Extract text from meaningful elements
@@ -303,6 +305,16 @@ def fetch_article_content(url: str, client: httpx.Client) -> str:
         text = el.get_text(strip=True)
         if text and len(text) > 10:
             parts.append(text)
+
+    # Some pages (e.g. media advisories) put the body in bare <div>s with no
+    # <p>/<li>; fall back to the innermost divs so content_text isn't empty.
+    if not parts:
+        for div in container.find_all("div"):
+            if div.find(["div", "p", "li", "td", "table", "ul", "ol"]):
+                continue
+            text = div.get_text(" ", strip=True)
+            if text and len(text) > 10:
+                parts.append(text)
 
     return "\n\n".join(parts)
 
