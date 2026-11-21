@@ -98,6 +98,17 @@ def make_id(url: str) -> str:
     return hashlib.sha256(url.encode()).hexdigest()[:12]
 
 
+def _normalize_url(url: str) -> str:
+    """Collapse www/non-www host variants so dedup survives sitemap flips.
+
+    The MOM sitemap switched from www.mom.gov.sg to bare mom.gov.sg URLs
+    around 2026-06, and the exact-string source_url dedup let the whole
+    archive re-import under the new host form. Normalising both sides of the
+    comparison prevents a repeat in either direction.
+    """
+    return url.replace("://www.", "://").rstrip("/").lower()
+
+
 def polite_sleep():
     delay = REQUEST_DELAY_BASE + random.uniform(-REQUEST_DELAY_JITTER, REQUEST_DELAY_JITTER)
     time.sleep(max(0.5, delay))
@@ -227,6 +238,7 @@ def discover_urls_from_sitemap(client: httpx.Client, existing_urls: set) -> List
     all_urls = [
         url_el.findtext("sm:loc", namespaces=ns) or "" for url_el in root.findall("sm:url", ns)
     ]
+    existing_norm = {_normalize_url(u) for u in existing_urls}
 
     # Filter to press release detail pages (not category/year index pages)
     # Detail URLs have the pattern: /press-releases/YYYY/MMDD-slug
@@ -241,7 +253,7 @@ def discover_urls_from_sitemap(client: httpx.Client, existing_urls: set) -> List
         year_match = re.search(r"/press-releases/(\d{4})/", url)
         if year_match and int(year_match.group(1)) < START_DATE.year:
             continue
-        if url in existing_urls:
+        if _normalize_url(url) in existing_norm:
             continue
         press_urls.append(url)
 
@@ -296,13 +308,42 @@ def fetch_article(url: str, client: httpx.Client) -> Dict[str, Any]:
         if m:
             published_date = parse_date_string(m.group(1))
 
-    # Content — try multiple selectors for ASP.NET layout
+    # Content — MOM serves two page templates:
+    #  * current: the body sits in #pagecontent_*_documentcontent_*_DivCode
+    #    as span/<br>-separated text with no p/li/td elements ('…description…'
+    #    sibling divs are empty — never select those)
+    #  * legacy: article/main/[class*='content'] containers with real
+    #    paragraphs
+    # The page-wide ASP.NET <form> must NOT be decomposed at body scope: it
+    # wraps the whole page, so removing it deletes the article too (that is
+    # how new-template pages used to be stored with empty content_text).
     content_text = ""
-    for selector in ["article", "main", "[class*='content']", "body"]:
-        container = soup.select_one(selector)
-        if container:
+    divcode = soup.find_all("div", id=re.compile(r"documentcontent_\d+_DivCode$"))
+    if divcode:
+        container = max(divcode, key=lambda d: len(d.get_text(strip=True)))
+        for el in container.find_all("h1"):
+            el.decompose()
+        for el in container.find_all("a", id=re.compile("RptCategory")):
+            el.decompose()
+        for el in container.find_all(["span", "p", "div"]):
+            if re.fullmatch(r"\d{1,2}\s+[A-Z][a-z]+\s+\d{4}", el.get_text(strip=True) or ""):
+                el.decompose()
+        for br in container.find_all("br"):
+            br.replace_with("\n\n")
+        text = container.get_text(" ", strip=True)
+        text = re.sub(r" *\n\n *", "\n\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+        i = text.find("Share this page")
+        if i != -1:
+            text = text[:i]
+        content_text = re.sub(r"\s+\n", "\n", text).strip()
+    else:
+        for selector in ["article", "main", "[class*='content']", "body"]:
+            container = soup.select_one(selector)
+            if not container:
+                continue
             for unwanted in container.find_all(
-                ["nav", "header", "footer", "script", "style", "aside", "form"]
+                ["nav", "header", "footer", "script", "style", "aside"]
             ):
                 unwanted.decompose()
             parts = [
@@ -310,9 +351,17 @@ def fetch_article(url: str, client: httpx.Client) -> Dict[str, Any]:
                 for el in container.find_all(["p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "td"])
                 if len(el.get_text(strip=True)) > 15
             ]
-            content_text = "\n\n".join(parts)
+            text = "\n\n".join(parts)
+            if len(text) > len(content_text):
+                content_text = text
             if len(content_text) > 100:
                 break
+
+    if not content_text:
+        # An empty extraction is a broken fetch, not an empty article: raise
+        # so tenacity retries it and fetch_data counts it in failed= instead
+        # of storing a blank row (the row is then re-discovered next run).
+        raise ValueError("no content extracted from page")
 
     return {
         "title": title,
