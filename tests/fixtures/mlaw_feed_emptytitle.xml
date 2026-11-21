@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Ministry of Law - News</title>
+  <link href="https://www.mlaw.gov.sg/news/"/>
+  <entry>
+    <title>Normal Feed Entry Title</title>
+    <link href="https://www.mlaw.gov.sg/normal-feed-entry/"/>
+    <published>2026-11-20T09:00:00+08:00</published>
+    <content type="html">&lt;p&gt;20 November 2026 Posted in Speeches&lt;/p&gt;&lt;p&gt;First body paragraph of the normal entry with enough text to extract.&lt;/p&gt;</content>
+  </entry>
+  <entry>
+    <title></title>
+    <link href="https://www.mlaw.gov.sg/entry-with-h1-fallback/"/>
+    <published>2026-11-19T09:00:00+08:00</published>
+    <content type="html">&lt;p&gt;19 November 2026 Posted in Speeches&lt;/p&gt;&lt;p&gt;Body paragraph of the untitled entry that should get the page h1.&lt;/p&gt;</content>
+  </entry>
+  <entry>
+    <title></title>
+    <link href="https://www.mlaw.gov.sg/entry-with-dead-link/"/>
+    <published>2026-11-18T09:00:00+08:00</published>
+    <content type="html">&lt;p&gt;18 November 2026 Posted in Speeches&lt;/p&gt;&lt;p&gt;Body paragraph of the untitled entry whose page is gone.&lt;/p&gt;</content>
+  </entry>
+</feed>
