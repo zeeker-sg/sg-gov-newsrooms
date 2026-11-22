@@ -250,6 +250,7 @@ def discover_news_from_feed(client: httpx.Client, existing_urls: set) -> List[Di
     items = []
     skipped_date = 0
     skipped_existing = 0
+    skipped_title = 0
 
     for entry in root.findall("atom:entry", ns):
         # URL
@@ -277,6 +278,25 @@ def discover_news_from_feed(client: httpx.Client, existing_urls: set) -> List[Di
 
         # Title
         title = (entry.findtext("atom:title", namespaces=ns) or "").strip()
+        if not title:
+            # Feed entries occasionally carry an empty <title> (seen on the
+            # dated 2026-10-21-post-* / 2026-10-29-post-* entries). Fall back
+            # to the linked page's <h1> so the Datasette label column and the
+            # title FTS field aren't blank; skip the entry if even that fails
+            # (better to miss a row than to store an untitled one).
+            try:
+                page = client.get(url)
+                page.raise_for_status()
+                page_soup = BeautifulSoup(page.content, "lxml")
+                h1 = page_soup.find("h1")
+                if h1:
+                    title = h1.get_text(strip=True)
+                    _echo(f"  empty feed title; using page <h1>: {title[:60]}")
+            except Exception as e:  # noqa: BLE001 - degrade to skip below
+                _echo(f"  title fallback fetch failed for {url}: {e}", err=True)
+        if not title:
+            skipped_title += 1
+            continue
 
         # Content (HTML, escaped inside XML CDATA or text)
         content_el = entry.find("atom:content", ns)
@@ -297,8 +317,9 @@ def discover_news_from_feed(client: httpx.Client, existing_urls: set) -> List[Di
         )
 
     _echo(
-        f"Feed: {len(items) + skipped_date + skipped_existing} entries. "
+        f"Feed: {len(items) + skipped_date + skipped_existing + skipped_title} entries. "
         f"{skipped_date} before {START_DATE}, {skipped_existing} already in DB, "
+        f"{skipped_title} without title, "
         f"{len(items)} new to process."
     )
     return items
